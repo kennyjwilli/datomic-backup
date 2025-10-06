@@ -1,0 +1,10 @@
+*.jar
+local
+.nrepl-port
+.idea
+*.iml
+.cpcache
+log
+dev/local
+.mcp.json
+*.local*
