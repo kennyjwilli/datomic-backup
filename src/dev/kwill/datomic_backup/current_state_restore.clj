@@ -434,7 +434,8 @@
   [db]
   (let [source-schema-lookup (impl/q-schema-lookup db)
         old->new-ident-lookup (impl/build-ident-alias-map db)
-        schema (::impl/schema-raw source-schema-lookup)
+        ;; TODO: add support for attr preds (must be done after full restore is done)
+        schema (map #(dissoc % :db.attr/preds) (::impl/schema-raw source-schema-lookup))
         all-idents (into #{} (map :db/ident) schema)]
     {:schema                schema
      :all-idents            all-idents
