@@ -1,19 +1,19 @@
 (ns dev.kwill.datomic-backup-test
   (:require
-   [clojure.test :refer :all]
-   [datomic.client.api :as d]
-   [dev.kwill.datomic-backup :as backup]
-   [dev.kwill.datomic-backup.impl :as impl]
-   [clojure.java.io :as io]
-   [dev.kwill.datomic-backup.test-helpers :as testh]))
+    [clojure.test :refer :all]
+    [datomic.client.api :as d]
+    [dev.kwill.datomic-backup :as backup]
+    [dev.kwill.datomic-backup.impl :as impl]
+    [clojure.java.io :as io]
+    [dev.kwill.datomic-backup.test-helpers :as testh]))
 
 (deftest get-backup-test
   (with-open [ctx (testh/test-ctx {})]
     (let [backup (backup/backup-db
-                  {:source-conn (:source-conn ctx)
-                   :backup-file (testh/tempfile)})]
+                   {:source-conn (:source-conn ctx)
+                    :backup-file (testh/tempfile)})]
       (is (= {:tx-count 0} backup)
-          "db with no transactions yields empty list"))))
+        "db with no transactions yields empty list"))))
 
 (deftest backup->conn-integration-test
   (with-open [ctx (testh/test-ctx {})]
@@ -22,66 +22,66 @@
       (let [file (testh/tempfile)
             backup (backup/backup-db {:source-conn (:source-conn ctx)
                                       :backup-file file})]
-        (backup/restore-db {:source file
+        (backup/restore-db {:source    file
                             :dest-conn (:dest-conn ctx)})
-        (is (= {:school/id 1
+        (is (= {:school/id       1
                 :school/students [{:student/email "johndoe@university.edu"
                                    :student/first "John"
-                                   :student/last "Doe"}]}
-               (d/pull (d/db (:dest-conn ctx))
-                       [:school/id
-                        {:school/students [:student/first
-                                           :student/last
-                                           :student/email]}]
-                       [:school/id 1])))))))
+                                   :student/last  "Doe"}]}
+              (d/pull (d/db (:dest-conn ctx))
+                [:school/id
+                 {:school/students [:student/first
+                                    :student/last
+                                    :student/email]}]
+                [:school/id 1])))))))
 
 (deftest conn->conn-integration-test
   (with-open [ctx (testh/test-ctx {})]
     (testing "restore conn -> conn"
       (testh/test-data! (:source-conn ctx))
-      (backup/restore-db {:source (:source-conn ctx)
+      (backup/restore-db {:source    (:source-conn ctx)
                           :dest-conn (:dest-conn ctx)})
-      (is (= {:school/id 1
+      (is (= {:school/id       1
               :school/students [{:student/email "johndoe@university.edu"
                                  :student/first "John"
-                                 :student/last "Doe"}]}
-             (d/pull (d/db (:dest-conn ctx))
-                     [:school/id
-                      {:school/students [:student/first
-                                         :student/last
-                                         :student/email]}]
-                     [:school/id 1]))))))
+                                 :student/last  "Doe"}]}
+            (d/pull (d/db (:dest-conn ctx))
+              [:school/id
+               {:school/students [:student/first
+                                  :student/last
+                                  :student/email]}]
+              [:school/id 1]))))))
 
 (deftest backup-current-db-integration-test
   (with-open [ctx (testh/test-ctx {})]
     (testh/test-data! (:source-conn ctx))
     (testing "restore conn -> conn"
       (let [file (testh/tempfile)
-            backup (backup/backup-db-no-history {:source-conn (:source-conn ctx)
+            backup (backup/backup-db-no-history {:source-conn                (:source-conn ctx)
                                                  :remove-empty-transactions? true
-                                                 :backup-file file
-                                                 :filter {:exclude-attrs [:student/first]}})]
+                                                 :backup-file                file
+                                                 :filter                     {:exclude-attrs [:student/first]}})]
         (is (= 3
-               (count
+              (count
                 (with-open [rdr (io/reader file)]
                   (vec (impl/transactions-from-source rdr {}))))))
-        (backup/restore-db {:source file
+        (backup/restore-db {:source    file
                             :progress? true
                             :dest-conn (:dest-conn ctx)})
-        (is (= {:school/id 1
+        (is (= {:school/id       1
                 :school/students [{:student/email "johndoe@university.edu"
-                                   :student/last "Doe"}]}
-               (d/pull (d/db (:dest-conn ctx))
-                       [:school/id
-                        {:school/students [:student/first
-                                           :student/last
-                                           :student/email]}]
-                       [:school/id 1])))
+                                   :student/last  "Doe"}]}
+              (d/pull (d/db (:dest-conn ctx))
+                [:school/id
+                 {:school/students [:student/first
+                                    :student/last
+                                    :student/email]}]
+                [:school/id 1])))
         (is (= (list)
-               (d/datoms (d/history (d/db (:dest-conn ctx)))
-                         {:index :eavt
-                          :components [[:course/id "BIO-102"]]}))
-            "no history of entity is included")))))
+              (d/datoms (d/history (d/db (:dest-conn ctx)))
+                {:index      :eavt
+                 :components [[:course/id "BIO-102"]]}))
+          "no history of entity is included")))))
 
 (deftest current-state-restore-test
   (with-open [ctx (testh/test-ctx {})]
@@ -89,17 +89,187 @@
     (testing "restore conn -> conn"
       (def r
         (backup/current-state-restore
-         {:source-db (d/db (:source-conn ctx))
-          :dest-conn (:dest-conn ctx)
-          :read-parallelism 1
-          :max-batch-size 1}))
-      (is (= {:school/id 1
+          {:source-db        (d/db (:source-conn ctx))
+           :dest-conn        (:dest-conn ctx)
+           :read-parallelism 1
+           :max-batch-size   1}))
+      (is (= {:school/id       1
               :school/students [{:student/email "johndoe@university.edu"
                                  :student/first "John"
-                                 :student/last "Doe"}]}
-             (d/pull (d/db (:dest-conn ctx))
-                     [:school/id
-                      {:school/students [:student/first
-                                         :student/last
-                                         :student/email]}]
-                     [:school/id 1]))))))
+                                 :student/last  "Doe"}]}
+            (d/pull (d/db (:dest-conn ctx))
+              [:school/id
+               {:school/students [:student/first
+                                  :student/last
+                                  :student/email]}]
+              [:school/id 1]))))))
+
+(deftest copy-schema-then-add-tuples-test
+  (testing "Complete workflow with tuple attributes"
+    (with-open [ctx (testh/test-ctx {})]
+      (let [schema [{:db/ident       :semester/year
+                     :db/valueType   :db.type/long
+                     :db/cardinality :db.cardinality/one}
+                    {:db/ident       :semester/season
+                     :db/valueType   :db.type/keyword
+                     :db/cardinality :db.cardinality/one}
+                    {:db/ident       :semester/year+season
+                     :db/valueType   :db.type/tuple
+                     :db/tupleAttrs  [:semester/year :semester/season]
+                     :db/cardinality :db.cardinality/one
+                     :db/unique      :db.unique/identity}]
+            _ (d/transact (:source-conn ctx) {:tx-data schema})
+            _ (d/transact (:source-conn ctx)
+                {:tx-data [{:semester/year 2024 :semester/season :spring}
+                           {:semester/year 2024 :semester/season :fall}
+                           {:semester/year 2025 :semester/season :spring}]})
+            source-db (d/db (:source-conn ctx))]
+
+        (backup/current-state-restore {:source-db        source-db
+                                       :dest-conn        (:dest-conn ctx)
+                                       :max-batch-size   100
+                                       :read-parallelism 4
+                                       :read-chunk       1000})
+
+        (let [db-after (d/db (:dest-conn ctx))
+              spring-2024 (d/pull db-after '[:semester/year :semester/season :semester/year+season]
+                            [:semester/year+season [2024 :spring]])
+              fall-2024 (d/pull db-after '[:semester/year :semester/season :semester/year+season]
+                          [:semester/year+season [2024 :fall]])
+              spring-2025 (d/pull db-after '[:semester/year :semester/season :semester/year+season]
+                            [:semester/year+season [2025 :spring]])]
+          (is (= [2024 :spring] (:semester/year+season spring-2024)))
+          (is (= [2024 :fall] (:semester/year+season fall-2024)))
+          (is (= [2025 :spring] (:semester/year+season spring-2025))))))))
+
+(deftest restore-with-tupleAttrs-basic-test
+  (testing "Full restore workflow with tupleAttrs"
+    (with-open [ctx (testh/test-ctx {})]
+      (let [schema [{:db/ident       :course/dept
+                     :db/valueType   :db.type/keyword
+                     :db/cardinality :db.cardinality/one}
+                    {:db/ident       :course/number
+                     :db/valueType   :db.type/long
+                     :db/cardinality :db.cardinality/one}
+                    {:db/ident       :course/id
+                     :db/valueType   :db.type/tuple
+                     :db/tupleAttrs  [:course/dept :course/number]
+                     :db/cardinality :db.cardinality/one
+                     :db/unique      :db.unique/identity}]
+            _ (d/transact (:source-conn ctx) {:tx-data schema})
+            _ (d/transact (:source-conn ctx)
+                {:tx-data [{:course/dept :cs :course/number 101}
+                           {:course/dept :cs :course/number 201}
+                           {:course/dept :math :course/number 101}]})
+            source-db (d/db (:source-conn ctx))]
+
+        (backup/current-state-restore {:source-db        source-db
+                                       :dest-conn        (:dest-conn ctx)
+                                       :max-batch-size   100
+                                       :read-parallelism 4
+                                       :read-chunk       1000})
+
+        (let [dest-db (d/db (:dest-conn ctx))
+              cs101 (d/pull dest-db '[:course/dept :course/number :course/id]
+                      [:course/id [:cs 101]])
+              cs201 (d/pull dest-db '[:course/dept :course/number :course/id]
+                      [:course/id [:cs 201]])
+              math101 (d/pull dest-db '[:course/dept :course/number :course/id]
+                        [:course/id [:math 101]])]
+          (is (= [:cs 101] (:course/id cs101)))
+          (is (= [:cs 201] (:course/id cs201)))
+          (is (= [:math 101] (:course/id math101))))))))
+
+(deftest restore-with-tupleAttrs-and-renamed-attrs-test
+  (testing "Full restore with renamed component attributes in tupleAttrs"
+    (with-open [ctx (testh/test-ctx {})]
+      (let [schema [{:db/ident       :course/dept
+                     :db/valueType   :db.type/keyword
+                     :db/cardinality :db.cardinality/one}
+                    {:db/ident       :course/number
+                     :db/valueType   :db.type/long
+                     :db/cardinality :db.cardinality/one}]
+            _ (d/transact (:source-conn ctx) {:tx-data schema})
+            _ (d/transact (:source-conn ctx)
+                {:tx-data [{:course/dept :cs :course/number 101}]})
+            ;; Rename :course/dept to :course/department
+            _ (d/transact (:source-conn ctx)
+                {:tx-data [{:db/id    :course/dept
+                            :db/ident :course/department}]})
+            ;; Add tuple attribute that uses the renamed attribute
+            _ (d/transact (:source-conn ctx)
+                {:tx-data [{:db/ident       :course/id-tuple
+                            :db/valueType   :db.type/tuple
+                            :db/tupleAttrs  [:course/department :course/number]
+                            :db/cardinality :db.cardinality/one
+                            :db/unique      :db.unique/identity}]})
+            ;; Add more data using the new ident
+            _ (d/transact (:source-conn ctx)
+                {:tx-data [{:course/department :math :course/number 201}]})
+            source-db (d/db (:source-conn ctx))]
+
+        (backup/current-state-restore {:source-db        source-db
+                                       :dest-conn        (:dest-conn ctx)
+                                       :max-batch-size   100
+                                       :read-parallelism 4
+                                       :read-chunk       1000})
+
+        (let [dest-db (d/db (:dest-conn ctx))
+              cs101 (d/pull dest-db '[:course/dept :course/department :course/number :course/id-tuple]
+                      [:course/id-tuple [:cs 101]])
+              math201 (d/pull dest-db '[:course/dept :course/department :course/number :course/id-tuple]
+                        [:course/id-tuple [:math 201]])]
+          (is (= :cs (:course/department cs101)))
+          (is (= :cs (:course/dept cs101)) "Old ident should work as alias")
+          (is (= 101 (:course/number cs101)))
+          (is (= [:cs 101] (:course/id-tuple cs101)))
+          (is (= [:math 201] (:course/id-tuple math201))))))))
+
+(deftest restore-with-multiple-tuples-test
+  (testing "Full restore with multiple tuple attributes"
+    (with-open [ctx (testh/test-ctx {})]
+      (let [schema [{:db/ident       :person/first-name
+                     :db/valueType   :db.type/string
+                     :db/cardinality :db.cardinality/one}
+                    {:db/ident       :person/last-name
+                     :db/valueType   :db.type/string
+                     :db/cardinality :db.cardinality/one}
+                    {:db/ident       :person/age
+                     :db/valueType   :db.type/long
+                     :db/cardinality :db.cardinality/one}
+                    {:db/ident       :person/full-name
+                     :db/valueType   :db.type/tuple
+                     :db/tupleAttrs  [:person/first-name :person/last-name]
+                     :db/cardinality :db.cardinality/one
+                     :db/unique      :db.unique/identity}
+                    {:db/ident       :person/name-and-age
+                     :db/valueType   :db.type/tuple
+                     :db/tupleAttrs  [:person/first-name :person/last-name :person/age]
+                     :db/cardinality :db.cardinality/one}]
+            _ (d/transact (:source-conn ctx) {:tx-data schema})
+            _ (d/transact (:source-conn ctx)
+                {:tx-data [{:person/first-name "Alice"
+                            :person/last-name  "Smith"
+                            :person/age        30}
+                           {:person/first-name "Bob"
+                            :person/last-name  "Jones"
+                            :person/age        25}]})
+            source-db (d/db (:source-conn ctx))]
+
+        (backup/current-state-restore {:source-db        source-db
+                                       :dest-conn        (:dest-conn ctx)
+                                       :max-batch-size   100
+                                       :read-parallelism 4
+                                       :read-chunk       1000})
+
+        (let [dest-db (d/db (:dest-conn ctx))
+              alice (d/pull dest-db '[:person/first-name :person/last-name :person/age
+                                      :person/full-name :person/name-and-age]
+                      [:person/full-name ["Alice" "Smith"]])
+              bob (d/pull dest-db '[:person/first-name :person/last-name :person/age
+                                    :person/full-name :person/name-and-age]
+                    [:person/full-name ["Bob" "Jones"]])]
+          (is (= ["Alice" "Smith"] (:person/full-name alice)))
+          (is (= ["Alice" "Smith" 30] (:person/name-and-age alice)))
+          (is (= ["Bob" "Jones"] (:person/full-name bob)))
+          (is (= ["Bob" "Jones" 25] (:person/name-and-age bob))))))))

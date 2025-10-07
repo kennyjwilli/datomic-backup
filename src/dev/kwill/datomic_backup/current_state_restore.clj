@@ -127,7 +127,6 @@
                                         {:backoff (retry/capped-exponential-backoff-with-jitter
                                                     {:max-retries 20})})
                                       (catch Exception ex
-                                        ;(sc.api/spy)
                                         (throw ex)))
                   next-old-id->new-id (into old-id->new-id
                                         (map (fn [[old-id tempid]]
@@ -155,8 +154,6 @@
             acc)
           :pending pending)))
     init-state datom-batches))
-
-(comment (sc.api/defsc 14))
 
 (defn read-datoms-in-parallel-sync
   [source-db {:keys [dest-ch parallelism]}]
@@ -358,7 +355,7 @@
                                (mapcat (fn [k]
                                          (let [v (get schema-map k)]
                                            (cond
-                                             (#{:db/tupleAttrs :db.entity/attrs} k)
+                                             (#{:db.entity/attrs} k)
                                              (if (sequential? v) v [])
 
                                              (and (contains? schema-idents k)
@@ -393,13 +390,40 @@
               next-available
               (conj waves next-wave))))))))
 
+(defn establish-composite!
+  "Reasserts all values of attr, in batches of batch-size, with
+  pacing-sec pause between transactions. This will establish values
+  for any composite attributes built from attr."
+  [conn {:keys [attr batch-size pacing-sec]}]
+  (let [db (d/db conn)
+        es (d/datoms db {:index      :aevt
+                         :components [attr]
+                         :limit      -1})]
+    (doseq [batch (partition-all batch-size es)]
+      (let [es (into #{} (map :e batch))
+            tx-data (map (fn [{:keys [e v]}] [:db/add e attr v]) batch)
+            result (retry/with-retry #(d/transact conn {:tx-data tx-data}))
+            added (transduce
+                    (comp (map :e) (filter es))
+                    (completing (fn [x ids] (inc x)))
+                    0
+                    (:tx-data result))]
+        (log/debug "establish-composite batch complete"
+          :batch-size batch-size
+          :first-e (:e (first batch))
+          :added added)
+        (Thread/sleep (* 1000 pacing-sec))))))
+
 (defn copy-schema!
-  [{:keys [dest-conn schema idents-to-copy old->new-ident-lookup]}]
+  [{:keys [dest-conn schema idents-to-copy old->new-ident-lookup include-tuple-attrs?]
+    :or   {include-tuple-attrs? true}}]
   (let [source-schema (filter (comp (set idents-to-copy) :db/ident) schema)
+        source-schema (if include-tuple-attrs?
+                        source-schema
+                        (remove :db/tupleAttrs source-schema))
         new->old-ident-lookup (sets/map-invert old->new-ident-lookup)
         waves (partition-schema-by-deps source-schema)]
     (doseq [wave waves]
-      ;; Check which attributes in this wave have been renamed
       (let [renamed-in-wave (keep (fn [attr]
                                     (when-let [old-ident (new->old-ident-lookup (:db/ident attr))]
                                       [(:db/ident attr) old-ident]))
@@ -407,9 +431,7 @@
             renamed-map (into {} renamed-in-wave)]
 
         (if (seq renamed-map)
-          ;; Wave contains renamed attributes: transact with old idents, then rename
           (do
-            ;; First, transact wave with old idents
             (let [wave-with-old-idents (mapv (fn [attr]
                                                (if-let [old-ident (get renamed-map (:db/ident attr))]
                                                  (assoc attr :db/ident old-ident)
@@ -417,14 +439,12 @@
                                          wave)]
               (retry/with-retry
                 #(d/transact dest-conn {:tx-data wave-with-old-idents})))
-            ;; Then, apply renames for all renamed attributes in this wave
             (let [rename-txs (mapv (fn [[new-ident old-ident]]
                                      {:db/id    old-ident
                                       :db/ident new-ident})
                                renamed-in-wave)]
               (retry/with-retry
                 #(d/transact dest-conn {:tx-data rename-txs}))))
-          ;; No renames in this wave: transact normally
           (retry/with-retry
             #(d/transact dest-conn {:tx-data wave})))))
 
@@ -442,17 +462,48 @@
      :old->new-ident-lookup old->new-ident-lookup}))
 
 (defn restore
-  [{:keys [source-db] :as argm}]
+  [{:keys [source-db dest-conn] :as argm}]
   (let [source-schema-lookup (impl/q-schema-lookup source-db)
         schema-args (get-schema-args source-db)
         copy-schema-argm (merge schema-args {:idents-to-copy (:all-idents schema-args)} argm)
-        _ (copy-schema! copy-schema-argm)
-        attribute-eids (map (fn [i]
-                              (get-in source-schema-lookup [::impl/ident->schema i :db/id]))
-                         (:idents-to-copy copy-schema-argm))]
-    (-full-copy (assoc argm
-                  :attribute-eids attribute-eids
-                  :schema-lookup source-schema-lookup))
+
+        ;; Step 1: Copy schema WITHOUT tuple attributes
+        _ (copy-schema! (assoc copy-schema-argm :include-tuple-attrs? false))
+
+        ;; Step 2: Restore data for non-tuple attributes only
+        tuple-attr-idents (into #{} (map :db/ident) (filter :db/tupleAttrs (:schema schema-args)))
+        non-tuple-idents (sets/difference (:all-idents schema-args) tuple-attr-idents)
+        non-tuple-attribute-eids (map (fn [i]
+                                        (get-in source-schema-lookup [::impl/ident->schema i :db/id]))
+                                   non-tuple-idents)
+
+        _ (-full-copy (assoc argm
+                        :attribute-eids non-tuple-attribute-eids
+                        :schema-lookup source-schema-lookup))
+
+        ;; Step 3: Add tuple attributes
+        tuple-attrs (filter :db/tupleAttrs (:schema schema-args))
+
+        _ (when (seq tuple-attrs)
+            (log/info "Adding tupleAttrs to schema after data restore"
+              :tuple-attr-count (count tuple-attrs))
+            (copy-schema! (assoc copy-schema-argm
+                            :idents-to-copy (into #{} (map :db/ident) tuple-attrs)
+                            :include-tuple-attrs? true)))
+
+        ;; Step 4: Establish composite values
+        _ (when (seq tuple-attrs)
+            (log/info "Establishing composite tuple values"
+              :tuple-attr-count (count tuple-attrs))
+            (doseq [tuple-attr tuple-attrs]
+              (doseq [component-attr (:db/tupleAttrs tuple-attr)]
+                (log/debug "Reasserting component attribute for tuple"
+                  :tuple-attr (:db/ident tuple-attr)
+                  :component-attr component-attr)
+                (establish-composite! dest-conn
+                  {:attr       component-attr
+                   :batch-size 500
+                   :pacing-sec 0}))))]
     true))
 
 (comment (sc.api/defsc 1)
