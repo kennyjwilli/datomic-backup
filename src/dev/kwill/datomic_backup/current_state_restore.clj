@@ -344,62 +344,84 @@
       ;(catch Exception ex (sc.api/spy) (throw ex))
       (finally (reset! *running? false)))))
 
+(defn partition-schema-by-deps
+  [source-schema]
+  (let [datomic-built-ins #{:db/ident :db/valueType :db/cardinality :db/doc
+                            :db/unique :db/isComponent :db/noHistory
+                            :db/tupleAttrs :db/tupleTypes :db/tupleType
+                            :db/ensure :db/fulltext :db/index
+                            :db.attr/preds :db.entity/attrs :db.entity/preds}
+        schema-idents (into #{} (map :db/ident) source-schema)
+        get-custom-attrs (fn [schema-map]
+                           (into #{}
+                             (comp
+                               (mapcat (fn [k]
+                                         (let [v (get schema-map k)]
+                                           (cond
+                                             (#{:db/tupleAttrs :db.entity/attrs} k)
+                                             (if (sequential? v) v [])
+
+                                             (and (contains? schema-idents k)
+                                               (not (contains? datomic-built-ins k)))
+                                             [k]
+
+                                             :else
+                                             []))))
+                               (remove datomic-built-ins))
+                             (keys schema-map)))
+        schema-vec (vec source-schema)]
+    (loop [remaining schema-vec
+           available #{}
+           waves []]
+      (if (empty? remaining)
+        waves
+        (let [next-wave (filterv (fn [attr]
+                                   (let [custom-attrs (get-custom-attrs attr)
+                                         required-attrs (sets/intersection custom-attrs schema-idents)]
+                                     (sets/subset? required-attrs available)))
+                          remaining)
+              next-available (into available (map :db/ident next-wave))
+              next-remaining (filterv (fn [attr]
+                                        (let [custom-attrs (get-custom-attrs attr)
+                                              required-attrs (sets/intersection custom-attrs schema-idents)]
+                                          (not (sets/subset? required-attrs available))))
+                               remaining)]
+          (if (empty? next-wave)
+            (throw (ex-info "Circular dependency in schema attributes"
+                     {:remaining-attrs (mapv :db/ident remaining)}))
+            (recur next-remaining
+              next-available
+              (conj waves next-wave))))))))
+
 (defn copy-schema!
   [{:keys [dest-conn schema idents-to-copy]}]
-  (let [source-schema (filter (comp (set idents-to-copy) :db/ident) schema)]
-    (retry/with-retry
-      #(d/transact dest-conn {:tx-data source-schema}))
+  (let [source-schema (filter (comp (set idents-to-copy) :db/ident) schema)
+        waves (partition-schema-by-deps source-schema)]
+    (doseq [wave waves]
+      (retry/with-retry
+        #(d/transact dest-conn {:tx-data wave})))
     {:source-schema source-schema}))
-
-(defn one-restore-pass
-  [{::keys [schema-lookup] :as argm} {::keys [idents]}]
-  (let [copy-schema-argm (assoc argm
-                           :schema (::impl/schema-raw schema-lookup)
-                           :idents-to-copy idents)
-        _ (copy-schema! copy-schema-argm)
-        attribute-eids (map (fn [i]
-                              (get-in schema-lookup [::impl/ident->schema i :db/id]))
-                         idents)
-        copy-argm (assoc argm
-                    :attribute-eids attribute-eids
-                    :schema-lookup schema-lookup)]
-    (-full-copy copy-argm)))
-
-(defn get-passes
-  [schema]
-  (let [filter-idents (fn [pred]
-                        (into #{}
-                          (comp
-                            (filter (fn [schema] (pred schema)))
-                            (map :db/ident)
-                            (remove (fn [ident]
-                                      (and (qualified-keyword? ident)
-                                        (or
-                                          (= "db" (namespace ident))
-                                          (str/starts-with? (namespace ident) "db."))))))
-                          schema))
-        batch2-pred #(= :db.type/tuple (:db/valueType %))
-        a-idents-1 (filter-idents #(not (batch2-pred %)))
-        a-idents-2 (filter-idents #(batch2-pred %))]
-    [{::idents a-idents-1}
-     {::idents a-idents-2}]))
 
 (defn restore
   [{:keys [source-db] :as argm}]
   (let [source-schema-lookup (impl/q-schema-lookup source-db)
-        passes (get-passes (::impl/schema-raw source-schema-lookup))
-        one-pass-argm (assoc argm
-                        ::schema-lookup source-schema-lookup)]
-    (reduce
-      (fn [full-copy-init-state pass]
-        (one-restore-pass (cond-> one-pass-argm
-                            full-copy-init-state
-                            (assoc :init-state full-copy-init-state))
-          pass))
-      nil passes)
+        all-schema (::impl/schema-raw source-schema-lookup)
+        all-idents (into #{} (map :db/ident) all-schema)
+        copy-schema-argm (assoc argm
+                           :schema all-schema
+                           :idents-to-copy all-idents)
+        _ (copy-schema! copy-schema-argm)
+        attribute-eids (map (fn [i]
+                              (get-in source-schema-lookup [::impl/ident->schema i :db/id]))
+                         all-idents)]
+    (-full-copy (assoc argm
+                  :attribute-eids attribute-eids
+                  :schema-lookup source-schema-lookup))
     true))
 
-(comment (sc.api/defsc 3))
+(comment (sc.api/defsc 1)
+  (first passes)
+  (one-restore-pass one-pass-argm (first passes)))
 
 (comment
   (def testc (d/client {:server-type :datomic-local

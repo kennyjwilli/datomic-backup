@@ -174,21 +174,21 @@
 (defn current-datom?
   [db datom]
   (and
-    ;; datom exists in current db
+   ;; datom exists in current db
    (first
     (d/datoms db {:index :eavt
                   :components [(:e datom) (:a datom) (:v datom)]
                   :limit 1}))
-    ;; if ref, make sure not a pointer to a non-existent datom
+   ;; if ref, make sure not a pointer to a non-existent datom
    (if (= :db.type/ref (attr-value-type db (:a datom)))
      (let [ds (d/datoms db {:index :vaet
                             :components [(:v datom)]
                             :limit 2})]
        (or
-          ;; if count is 2 or more, datom should be included
+        ;; if count is 2 or more, datom should be included
         (= 2 (bounded-count 2 ds))
-          ;; if nil or only datom's value is equal to the current datom, this
-          ;; reference is no longer relevant.
+        ;; if nil or only datom's value is equal to the current datom, this
+        ;; reference is no longer relevant.
         (not= (:v (first ds)) (:v datom))))
      true)))
 
@@ -340,11 +340,47 @@
            (assoc-in [::ident->schema ident] cleaned-schema))))
    {} schema-result))
 
+(defn build-ident-alias-map
+  [db]
+  (let [history-db (d/history db)
+        ident-changes (d/q '[:find ?e ?old-ident ?new-ident ?tx
+                             :where
+                             [?e :db/ident ?old-ident ?tx false]
+                             [?e :db/ident ?new-ident ?tx true]]
+                           history-db)]
+    (into {}
+          (map (fn [[_e old-ident new-ident _tx]]
+                 [old-ident new-ident]))
+          ident-changes)))
+
+(defn rewrite-schema-references
+  [schema ident-alias-map]
+  (walk/postwalk
+   (fn [x]
+     (cond
+       (and (map? x)
+            (contains? x :db/tupleAttrs))
+       (update x :db/tupleAttrs
+               (fn [attrs]
+                 (mapv #(get ident-alias-map % %) attrs)))
+
+       (and (map? x)
+            (contains? x :db.entity/attrs))
+       (update x :db.entity/attrs
+               (fn [attrs]
+                 (mapv #(get ident-alias-map % %) attrs)))
+
+       :else
+       x))
+   schema))
+
 (defn q-schema-lookup
   [db]
-  (schema-result->lookup
-   (d/q {:query '[:find (pull ?a [*])
-                  :where
-                  [:db.part/db :db.install/attribute ?a]]
-         :args [db]
-         :limit -1})))
+  (let [ident-alias-map (build-ident-alias-map db)
+        schema-result (d/q {:query '[:find (pull ?a [*])
+                                     :where
+                                     [:db.part/db :db.install/attribute ?a]]
+                            :args [db]
+                            :limit -1})
+        rewritten-schema (rewrite-schema-references schema-result ident-alias-map)]
+    (schema-result->lookup rewritten-schema)))
