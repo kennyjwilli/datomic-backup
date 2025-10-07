@@ -353,34 +353,11 @@
                  [old-ident new-ident]))
           ident-changes)))
 
-(defn rewrite-schema-references
-  [schema ident-alias-map]
-  (walk/postwalk
-   (fn [x]
-     (cond
-       (and (map? x)
-            (contains? x :db/tupleAttrs))
-       (update x :db/tupleAttrs
-               (fn [attrs]
-                 (mapv #(get ident-alias-map % %) attrs)))
-
-       (and (map? x)
-            (contains? x :db.entity/attrs))
-       (update x :db.entity/attrs
-               (fn [attrs]
-                 (mapv #(get ident-alias-map % %) attrs)))
-
-       :else
-       x))
-   schema))
-
 (defn q-schema-lookup
   [db]
-  (let [ident-alias-map (build-ident-alias-map db)
-        schema-result (d/q {:query '[:find (pull ?a [*])
+  (let [schema-result (d/q {:query '[:find (pull ?a [*])
                                      :where
                                      [:db.part/db :db.install/attribute ?a]]
                             :args [db]
-                            :limit -1})
-        rewritten-schema (rewrite-schema-references schema-result ident-alias-map)]
-    (schema-result->lookup rewritten-schema)))
+                            :limit -1})]
+    (schema-result->lookup schema-result)))

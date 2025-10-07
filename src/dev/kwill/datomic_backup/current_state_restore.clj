@@ -394,26 +394,62 @@
               (conj waves next-wave))))))))
 
 (defn copy-schema!
-  [{:keys [dest-conn schema idents-to-copy]}]
+  [{:keys [dest-conn schema idents-to-copy old->new-ident-lookup]}]
   (let [source-schema (filter (comp (set idents-to-copy) :db/ident) schema)
+        new->old-ident-lookup (sets/map-invert old->new-ident-lookup)
         waves (partition-schema-by-deps source-schema)]
     (doseq [wave waves]
-      (retry/with-retry
-        #(d/transact dest-conn {:tx-data wave})))
+      ;; Check which attributes in this wave have been renamed
+      (let [renamed-in-wave (keep (fn [attr]
+                                    (when-let [old-ident (new->old-ident-lookup (:db/ident attr))]
+                                      [(:db/ident attr) old-ident]))
+                              wave)
+            renamed-map (into {} renamed-in-wave)]
+
+        (if (seq renamed-map)
+          ;; Wave contains renamed attributes: transact with old idents, then rename
+          (do
+            ;; First, transact wave with old idents
+            (let [wave-with-old-idents (mapv (fn [attr]
+                                               (if-let [old-ident (get renamed-map (:db/ident attr))]
+                                                 (assoc attr :db/ident old-ident)
+                                                 attr))
+                                         wave)]
+              (retry/with-retry
+                #(d/transact dest-conn {:tx-data wave-with-old-idents})))
+            ;; Then, apply renames for all renamed attributes in this wave
+            (let [rename-txs (mapv (fn [[new-ident old-ident]]
+                                     {:db/id    old-ident
+                                      :db/ident new-ident})
+                               renamed-in-wave)]
+              (retry/with-retry
+                #(d/transact dest-conn {:tx-data rename-txs}))))
+          ;; No renames in this wave: transact normally
+          (retry/with-retry
+            #(d/transact dest-conn {:tx-data wave})))))
+
     {:source-schema source-schema}))
+
+(defn get-schema-args
+  [db]
+  (let [source-schema-lookup (impl/q-schema-lookup db)
+        old->new-ident-lookup (impl/build-ident-alias-map db)
+        schema (::impl/schema-raw source-schema-lookup)
+        all-idents (into #{} (map :db/ident) schema)]
+    {:schema                schema
+     :all-idents            all-idents
+     :idents-to-copy        all-idents
+     :old->new-ident-lookup old->new-ident-lookup}))
 
 (defn restore
   [{:keys [source-db] :as argm}]
   (let [source-schema-lookup (impl/q-schema-lookup source-db)
-        all-schema (::impl/schema-raw source-schema-lookup)
-        all-idents (into #{} (map :db/ident) all-schema)
-        copy-schema-argm (assoc argm
-                           :schema all-schema
-                           :idents-to-copy all-idents)
+        schema-args (get-schema-args source-db)
+        copy-schema-argm (merge argm schema-args)
         _ (copy-schema! copy-schema-argm)
         attribute-eids (map (fn [i]
                               (get-in source-schema-lookup [::impl/ident->schema i :db/id]))
-                         all-idents)]
+                         (:all-idents schema-args))]
     (-full-copy (assoc argm
                   :attribute-eids attribute-eids
                   :schema-lookup source-schema-lookup))

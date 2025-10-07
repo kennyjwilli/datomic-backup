@@ -3,16 +3,7 @@
    [clojure.test :refer :all]
    [datomic.client.api :as d]
    [dev.kwill.datomic-backup.current-state-restore :as csr]
-   [dev.kwill.datomic-backup.impl :as impl]
    [dev.kwill.datomic-backup.test-helpers :as testh]))
-
-(defn get-schema-args
-  [db]
-  (let [source-schema-lookup (impl/q-schema-lookup db)
-        schema (::impl/schema-raw source-schema-lookup)
-        all-idents (into #{} (map :db/ident) schema)]
-    {:schema schema
-     :idents-to-copy all-idents}))
 
 (deftest copy-schema-basic-test
   (testing "Copy basic schema attributes"
@@ -31,14 +22,15 @@
                            :db/cardinality :db.cardinality/many}]
             _ (d/transact (:source-conn ctx) {:tx-data basic-schema})
             source-db (d/db (:source-conn ctx))
-            source-schema-args (get-schema-args source-db)]
+            source-schema-args (csr/get-schema-args source-db)]
 
         ;; Copy schema to dest
-        (csr/copy-schema! (assoc source-schema-args :dest-conn (:dest-conn ctx)))
+        (csr/copy-schema! (assoc source-schema-args
+                                 :dest-conn (:dest-conn ctx)))
 
         ;; Verify schema matches
         (let [dest-db (d/db (:dest-conn ctx))
-              dest-schema-args (get-schema-args dest-db)]
+              dest-schema-args (csr/get-schema-args dest-db)]
           (is (= (set (:schema source-schema-args))
                  (set (:schema dest-schema-args)))))))))
 
@@ -58,14 +50,15 @@
                                :db/unique :db.unique/identity}]
             _ (d/transact (:source-conn ctx) {:tx-data schema-with-deps})
             source-db (d/db (:source-conn ctx))
-            source-schema-args (get-schema-args source-db)]
+            source-schema-args (csr/get-schema-args source-db)]
 
         ;; Copy schema to dest - should handle dependencies correctly
-        (csr/copy-schema! (assoc source-schema-args :dest-conn (:dest-conn ctx)))
+        (csr/copy-schema! (assoc source-schema-args
+                                 :dest-conn (:dest-conn ctx)))
 
         ;; Verify schema matches
         (let [dest-db (d/db (:dest-conn ctx))
-              dest-schema-args (get-schema-args dest-db)]
+              dest-schema-args (csr/get-schema-args dest-db)]
           (is (= (set (:schema source-schema-args))
                  (set (:schema dest-schema-args)))))
 
@@ -81,6 +74,106 @@
           (is (= :spring (:semester/season result)))
           (is (= [2024 :spring] (:semester/year+season result))))))))
 
+(deftest copy-schema-with-tupleAttrs-renamed-test
+  (testing "Copy schema with tupleAttrs where a referenced attribute has been renamed"
+    (with-open [ctx (testh/test-ctx {})]
+      (let [;; Step 1: Create initial schema with tupleAttrs
+            initial-schema [{:db/ident :semester/year
+                             :db/valueType :db.type/long
+                             :db/cardinality :db.cardinality/one}
+                            {:db/ident :semester/season
+                             :db/valueType :db.type/keyword
+                             :db/cardinality :db.cardinality/one}
+                            {:db/ident :semester/year+season
+                             :db/valueType :db.type/tuple
+                             :db/tupleAttrs [:semester/year :semester/season]
+                             :db/cardinality :db.cardinality/one
+                             :db/unique :db.unique/identity}]
+            _ (d/transact (:source-conn ctx) {:tx-data initial-schema})
+
+            ;; Step 2: Rename :semester/year to :semester/full-year
+            _ (d/transact (:source-conn ctx)
+                          {:tx-data [{:db/id :semester/year
+                                      :db/ident :semester/full-year}]})
+
+            ;; Step 3: Add test data in source using the new ident
+            _ (d/transact (:source-conn ctx)
+                          {:tx-data [{:semester/full-year 2024
+                                      :semester/season :spring}]})
+
+            source-db (d/db (:source-conn ctx))
+            source-schema-args (csr/get-schema-args source-db)]
+
+        ;; Copy schema to dest - should handle renamed attributes correctly
+        (csr/copy-schema! (assoc source-schema-args
+                                 :dest-conn (:dest-conn ctx)))
+
+        ;; Verify schema in destination
+        (let [dest-db (d/db (:dest-conn ctx))
+              dest-schema-args (csr/get-schema-args dest-db)
+
+              ;; Get the tuple attribute from dest schema
+              dest-tuple-attr (first (filter #(= :semester/year+season (:db/ident %))
+                                             (:schema dest-schema-args)))
+
+              ;; Test: Can we look up both old and new idents in source?
+              source-old-ident (d/pull source-db '[:db/ident] :semester/year)
+              source-new-ident (d/pull source-db '[:db/ident] :semester/full-year)
+
+              ;; Test: Can we look up both old and new idents in dest?
+              dest-old-ident (d/pull dest-db '[:db/ident] :semester/year)
+              dest-new-ident (d/pull dest-db '[:db/ident] :semester/full-year)]
+
+          ;; Verify the tuple's tupleAttrs are correctly rewritten to use the new ident
+          (is (= [:semester/year :semester/season]
+                 (:db/tupleAttrs dest-tuple-attr))
+              "tupleAttrs should keep old idents - they work as aliases")
+
+          ;; Verify both old and new idents work in source
+          (is (= :semester/full-year (:db/ident source-old-ident))
+              "Old ident in source should resolve to new ident")
+          (is (= :semester/full-year (:db/ident source-new-ident))
+              "New ident in source should resolve to itself")
+
+          ;; Verify both old and new idents work in dest (this tests alias preservation)
+          (is (= :semester/full-year (:db/ident dest-new-ident))
+              "New ident in dest should exist")
+          (is (= :semester/full-year (:db/ident dest-old-ident))
+              "Old ident in dest should resolve to new ident (alias preserved)")
+
+          ;; Verify we can transact data using the new ident
+          (d/transact (:dest-conn ctx)
+                      {:tx-data [{:semester/full-year 2025
+                                  :semester/season :fall}]})
+
+          ;; Verify we can transact data using the old ident (alias)
+          (d/transact (:dest-conn ctx)
+                      {:tx-data [{:semester/year 2026
+                                  :semester/season :winter}]})
+
+          ;; Verify tuple lookups work
+          (let [result-2025 (d/pull (d/db (:dest-conn ctx))
+                                    '[:semester/year :semester/full-year
+                                      :semester/season :semester/year+season]
+                                    [:semester/year+season [2025 :fall]])
+                result-2026 (d/pull (d/db (:dest-conn ctx))
+                                    '[:semester/year :semester/full-year
+                                      :semester/season :semester/year+season]
+                                    [:semester/year+season [2026 :winter]])]
+
+            ;; Both :semester/year and :semester/full-year should return the same value
+            (is (= 2025 (:semester/full-year result-2025)))
+            (is (= 2025 (:semester/year result-2025))
+                "Old ident should work as an alias for reading")
+            (is (= :fall (:semester/season result-2025)))
+            (is (= [2025 :fall] (:semester/year+season result-2025)))
+
+            (is (= 2026 (:semester/full-year result-2026)))
+            (is (= 2026 (:semester/year result-2026))
+                "Old ident should work as an alias for reading")
+            (is (= :winter (:semester/season result-2026)))
+            (is (= [2026 :winter] (:semester/year+season result-2026)))))))))
+
 (deftest copy-schema-rename-test
   (testing "Schema ident renaming behavior"
     (with-open [ctx (testh/test-ctx {})]
@@ -95,14 +188,16 @@
                                       :db/ident :person/full-name}]})
 
             source-db (d/db (:source-conn ctx))
-            source-schema-args (get-schema-args source-db)]
+            source-schema-args (csr/get-schema-args source-db)]
 
         ;; Copy the renamed schema
-        (csr/copy-schema! (assoc source-schema-args :dest-conn (:dest-conn ctx)))
+        (csr/copy-schema! (assoc source-schema-args
+                                 :dest-conn (:dest-conn ctx)
+                                 :source-db source-db))
 
         ;; Verify schema matches
         (let [dest-db (d/db (:dest-conn ctx))
-              dest-schema-args (get-schema-args dest-db)]
+              dest-schema-args (csr/get-schema-args dest-db)]
           (is (= (set (:schema source-schema-args))
                  (set (:schema dest-schema-args)))))
 
@@ -143,13 +238,15 @@
                             :db/unique :db.unique/identity}]
             _ (d/transact (:source-conn ctx) {:tx-data unique-schema})
             source-db (d/db (:source-conn ctx))
-            source-schema-args (get-schema-args source-db)]
+            source-schema-args (csr/get-schema-args source-db)]
 
-        (csr/copy-schema! (assoc source-schema-args :dest-conn (:dest-conn ctx)))
+        (csr/copy-schema! (assoc source-schema-args
+                                 :dest-conn (:dest-conn ctx)
+                                 :source-db source-db))
 
         ;; Verify schema matches
         (let [dest-db (d/db (:dest-conn ctx))
-              dest-schema-args (get-schema-args dest-db)]
+              dest-schema-args (csr/get-schema-args dest-db)]
           (is (= (set (:schema source-schema-args))
                  (set (:schema dest-schema-args)))))
 
@@ -177,13 +274,15 @@
                          :db/cardinality :db.cardinality/one}]
             _ (d/transact (:source-conn ctx) {:tx-data ref-schema})
             source-db (d/db (:source-conn ctx))
-            source-schema-args (get-schema-args source-db)]
+            source-schema-args (csr/get-schema-args source-db)]
 
-        (csr/copy-schema! (assoc source-schema-args :dest-conn (:dest-conn ctx)))
+        (csr/copy-schema! (assoc source-schema-args
+                                 :dest-conn (:dest-conn ctx)
+                                 :source-db source-db))
 
         ;; Verify schema matches
         (let [dest-db (d/db (:dest-conn ctx))
-              dest-schema-args (get-schema-args dest-db)]
+              dest-schema-args (csr/get-schema-args dest-db)]
           (is (= (set (:schema source-schema-args))
                  (set (:schema dest-schema-args)))))
 
@@ -226,14 +325,16 @@
                              :db/cardinality :db.cardinality/one}]
             _ (d/transact (:source-conn ctx) {:tx-data complex-schema})
             source-db (d/db (:source-conn ctx))
-            source-schema-args (get-schema-args source-db)]
+            source-schema-args (csr/get-schema-args source-db)]
 
         ;; Should successfully handle multi-wave dependencies
-        (csr/copy-schema! (assoc source-schema-args :dest-conn (:dest-conn ctx)))
+        (csr/copy-schema! (assoc source-schema-args
+                                 :dest-conn (:dest-conn ctx)
+                                 :source-db source-db))
 
         ;; Verify schema matches
         (let [dest-db (d/db (:dest-conn ctx))
-              dest-schema-args (get-schema-args dest-db)]
+              dest-schema-args (csr/get-schema-args dest-db)]
           (is (= (set (:schema source-schema-args))
                  (set (:schema dest-schema-args)))))
 
