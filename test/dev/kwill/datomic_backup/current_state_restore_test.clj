@@ -26,7 +26,7 @@
 
         (csr/copy-schema! (assoc source-schema-args
                             :dest-conn (:dest-conn ctx)
-                            :idents-to-copy (:all-idents source-schema-args)))
+                            :schema (:schema source-schema-args)))
 
         (let [dest-db (d/db (:dest-conn ctx))
               dest-schema-args (csr/get-schema-args dest-db)]
@@ -54,7 +54,7 @@
         ;; Copy schema to dest - should handle dependencies correctly
         (csr/copy-schema! (assoc source-schema-args
                             :dest-conn (:dest-conn ctx)
-                            :idents-to-copy (:all-idents source-schema-args)))
+                            :schema (:schema source-schema-args)))
 
         ;; Verify schema matches
         (let [dest-db (d/db (:dest-conn ctx))
@@ -107,7 +107,7 @@
         ;; Copy schema to dest - should handle renamed attributes correctly
         (csr/copy-schema! (assoc source-schema-args
                             :dest-conn (:dest-conn ctx)
-                            :idents-to-copy (:all-idents source-schema-args)))
+                            :schema (:schema source-schema-args)))
 
         ;; Verify schema in destination
         (let [dest-db (d/db (:dest-conn ctx))
@@ -194,8 +194,7 @@
         ;; Copy the renamed schema
         (csr/copy-schema! (assoc source-schema-args
                             :dest-conn (:dest-conn ctx)
-                            :idents-to-copy (:all-idents source-schema-args)
-                            :source-db source-db))
+                            :schema (:schema source-schema-args)))
 
         ;; Verify schema matches
         (let [dest-db (d/db (:dest-conn ctx))
@@ -227,9 +226,9 @@
 (deftest copy-schema-edge-cases-test
   (testing "Empty schema"
     (with-open [ctx (testh/test-ctx {})]
-      (let [result (csr/copy-schema! {:dest-conn      (:dest-conn ctx)
-                                      :schema         []
-                                      :idents-to-copy #{}})]
+      (let [result (csr/copy-schema! {:dest-conn             (:dest-conn ctx)
+                                      :schema                []
+                                      :old->new-ident-lookup {}})]
         (is (= {:source-schema []} result)))))
 
   (testing "Schema with unique constraint"
@@ -244,8 +243,7 @@
 
         (csr/copy-schema! (assoc source-schema-args
                             :dest-conn (:dest-conn ctx)
-                            :idents-to-copy (:all-idents source-schema-args)
-                            :source-db source-db))
+                            :schema (:schema source-schema-args)))
 
         ;; Verify schema matches
         (let [dest-db (d/db (:dest-conn ctx))
@@ -281,8 +279,7 @@
 
         (csr/copy-schema! (assoc source-schema-args
                             :dest-conn (:dest-conn ctx)
-                            :idents-to-copy (:all-idents source-schema-args)
-                            :source-db source-db))
+                            :schema (:schema source-schema-args)))
 
         ;; Verify schema matches
         (let [dest-db (d/db (:dest-conn ctx))
@@ -334,8 +331,7 @@
         ;; Should successfully handle multi-wave dependencies
         (csr/copy-schema! (assoc source-schema-args
                             :dest-conn (:dest-conn ctx)
-                            :idents-to-copy (:all-idents source-schema-args)
-                            :source-db source-db))
+                            :schema (:schema source-schema-args)))
 
         ;; Verify schema matches
         (let [dest-db (d/db (:dest-conn ctx))
@@ -400,7 +396,7 @@
           (is (= ["Bob" "Jones"] (:person/full-name bob-after))))))))
 
 (deftest copy-schema-without-tuple-attrs-test
-  (testing "copy-schema! with :include-tuple-attrs? false skips tuple attributes"
+  (testing "copy-schema! with pre-filtered schema skips tuple attributes"
     (with-open [ctx (testh/test-ctx {})]
       (let [schema-with-tuple [{:db/ident       :semester/year
                                 :db/valueType   :db.type/long
@@ -419,8 +415,7 @@
 
         (csr/copy-schema! (assoc source-schema-args
                             :dest-conn (:dest-conn ctx)
-                            :idents-to-copy (:all-idents source-schema-args)
-                            :include-tuple-attrs? false))
+                            :schema (remove :db/tupleAttrs (:schema source-schema-args))))
 
         (let [dest-db (d/db (:dest-conn ctx))
               year-attr (d/pull dest-db '[:db/ident :db/valueType] :semester/year)
@@ -432,6 +427,6 @@
           (is (= :semester/season (:db/ident season-attr))
             "Component attributes should be copied")
           (is (nil? (:db/ident tuple-attr))
-            "Tuple attribute should NOT be created when include-tuple-attrs? is false"))))))
+            "Tuple attribute should NOT be created when schema is pre-filtered"))))))
 
 

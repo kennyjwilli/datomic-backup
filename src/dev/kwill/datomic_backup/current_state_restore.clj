@@ -415,14 +415,9 @@
         (Thread/sleep (* 1000 pacing-sec))))))
 
 (defn copy-schema!
-  [{:keys [dest-conn schema idents-to-copy old->new-ident-lookup include-tuple-attrs?]
-    :or   {include-tuple-attrs? true}}]
-  (let [source-schema (filter (comp (set idents-to-copy) :db/ident) schema)
-        source-schema (if include-tuple-attrs?
-                        source-schema
-                        (remove :db/tupleAttrs source-schema))
-        new->old-ident-lookup (sets/map-invert old->new-ident-lookup)
-        waves (partition-schema-by-deps source-schema)]
+  [{:keys [dest-conn schema old->new-ident-lookup]}]
+  (let [new->old-ident-lookup (sets/map-invert old->new-ident-lookup)
+        waves (partition-schema-by-deps schema)]
     (doseq [wave waves]
       (let [renamed-in-wave (keep (fn [attr]
                                     (when-let [old-ident (new->old-ident-lookup (:db/ident attr))]
@@ -448,62 +443,65 @@
           (retry/with-retry
             #(d/transact dest-conn {:tx-data wave})))))
 
-    {:source-schema source-schema}))
+    {:source-schema schema}))
 
 (defn get-schema-args
   [db]
   (let [source-schema-lookup (impl/q-schema-lookup db)
         old->new-ident-lookup (impl/build-ident-alias-map db)
         ;; TODO: add support for attr preds (must be done after full restore is done)
-        schema (map #(dissoc % :db.attr/preds) (::impl/schema-raw source-schema-lookup))
-        all-idents (into #{} (map :db/ident) schema)]
+        schema (map #(dissoc % :db.attr/preds) (::impl/schema-raw source-schema-lookup))]
     {:schema                schema
-     :all-idents            all-idents
      :old->new-ident-lookup old->new-ident-lookup}))
+
+(defn add-tuple-attrs!
+  "Adds tuple attributes to schema and establishes their composite values."
+  [{:keys [dest-conn tuple-schema old->new-ident-lookup]}]
+  (when (seq tuple-schema)
+    (log/info "Adding tupleAttrs to schema after data restore"
+      :tuple-attr-count (count tuple-schema))
+    (copy-schema! {:dest-conn             dest-conn
+                   :schema                tuple-schema
+                   :old->new-ident-lookup old->new-ident-lookup})
+
+    (log/info "Establishing composite tuple values"
+      :tuple-attr-count (count tuple-schema))
+    (doseq [tuple-attr tuple-schema]
+      (doseq [component-attr (:db/tupleAttrs tuple-attr)]
+        (log/debug "Reasserting component attribute for tuple"
+          :tuple-attr (:db/ident tuple-attr)
+          :component-attr component-attr)
+        (establish-composite! dest-conn
+          {:attr       component-attr
+           :batch-size 500
+           :pacing-sec 0})))))
 
 (defn restore
   [{:keys [source-db dest-conn] :as argm}]
   (let [source-schema-lookup (impl/q-schema-lookup source-db)
-        schema-args (get-schema-args source-db)
-        copy-schema-argm (merge schema-args {:idents-to-copy (:all-idents schema-args)} argm)
+        {:keys [schema old->new-ident-lookup]} (get-schema-args source-db)
 
         ;; Step 1: Copy schema WITHOUT tuple attributes
-        _ (copy-schema! (assoc copy-schema-argm :include-tuple-attrs? false))
+        ;; We'll add these in at the end.
+        non-tuple-schema (remove :db/tupleAttrs schema)
+        _ (copy-schema! {:dest-conn             dest-conn
+                         :schema                non-tuple-schema
+                         :old->new-ident-lookup old->new-ident-lookup})
 
         ;; Step 2: Restore data for non-tuple attributes only
-        tuple-attr-idents (into #{} (map :db/ident) (filter :db/tupleAttrs (:schema schema-args)))
-        non-tuple-idents (sets/difference (:all-idents schema-args) tuple-attr-idents)
-        non-tuple-attribute-eids (map (fn [i]
-                                        (get-in source-schema-lookup [::impl/ident->schema i :db/id]))
-                                   non-tuple-idents)
+        non-tuple-attribute-eids (into []
+                                   (map (fn [{:db/keys [ident]}]
+                                          (get-in source-schema-lookup [::impl/ident->schema ident :db/id])))
+                                   non-tuple-schema)
 
         _ (-full-copy (assoc argm
                         :attribute-eids non-tuple-attribute-eids
                         :schema-lookup source-schema-lookup))
 
-        ;; Step 3: Add tuple attributes
-        tuple-attrs (filter :db/tupleAttrs (:schema schema-args))
-
-        _ (when (seq tuple-attrs)
-            (log/info "Adding tupleAttrs to schema after data restore"
-              :tuple-attr-count (count tuple-attrs))
-            (copy-schema! (assoc copy-schema-argm
-                            :idents-to-copy (into #{} (map :db/ident) tuple-attrs)
-                            :include-tuple-attrs? true)))
-
-        ;; Step 4: Establish composite values
-        _ (when (seq tuple-attrs)
-            (log/info "Establishing composite tuple values"
-              :tuple-attr-count (count tuple-attrs))
-            (doseq [tuple-attr tuple-attrs]
-              (doseq [component-attr (:db/tupleAttrs tuple-attr)]
-                (log/debug "Reasserting component attribute for tuple"
-                  :tuple-attr (:db/ident tuple-attr)
-                  :component-attr component-attr)
-                (establish-composite! dest-conn
-                  {:attr       component-attr
-                   :batch-size 500
-                   :pacing-sec 0}))))]
+        ;; Step 3: Add tuple attributes and establish composite values
+        _ (add-tuple-attrs! {:dest-conn             dest-conn
+                             :tuple-schema          (filter :db/tupleAttrs schema)
+                             :old->new-ident-lookup old->new-ident-lookup})]
     true))
 
 (comment (sc.api/defsc 1)
