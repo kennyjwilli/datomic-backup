@@ -292,7 +292,7 @@
 (defn get-next-tx-id
   [conn]
   (-> (d/with-db conn)
-      (d/with {})
+      (d/with {:tx-data []})
       :tx-data
       first
       :tx))
