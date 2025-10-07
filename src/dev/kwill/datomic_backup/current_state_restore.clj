@@ -438,18 +438,17 @@
         all-idents (into #{} (map :db/ident) schema)]
     {:schema                schema
      :all-idents            all-idents
-     :idents-to-copy        all-idents
      :old->new-ident-lookup old->new-ident-lookup}))
 
 (defn restore
   [{:keys [source-db] :as argm}]
   (let [source-schema-lookup (impl/q-schema-lookup source-db)
         schema-args (get-schema-args source-db)
-        copy-schema-argm (merge argm schema-args)
+        copy-schema-argm (merge schema-args {:idents-to-copy (:all-idents schema-args)} argm)
         _ (copy-schema! copy-schema-argm)
         attribute-eids (map (fn [i]
                               (get-in source-schema-lookup [::impl/ident->schema i :db/id]))
-                         (:all-idents schema-args))]
+                         (:idents-to-copy copy-schema-argm))]
     (-full-copy (assoc argm
                   :attribute-eids attribute-eids
                   :schema-lookup source-schema-lookup))
