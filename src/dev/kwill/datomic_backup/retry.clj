@@ -23,7 +23,7 @@
             rand-int]
      :or   {base          100
             max-backoff   10000
-            max-retries   5
+            max-retries   15
             max-jitter-ms 100
             rand-int      rand-int}}]
    (let [backoff-fn (capped-exponential-backoff
