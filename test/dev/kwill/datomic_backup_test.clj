@@ -73,6 +73,33 @@
                     (is (= [:cs 201] (:course/id cs201)))
                     (is (= [:math 101] (:course/id math101)))))}
 
+   {:name       "Composite tuples with duplicate component values"
+    :schema     [[{:db/ident       :location/city
+                   :db/valueType   :db.type/string
+                   :db/cardinality :db.cardinality/one}
+                  {:db/ident       :location/state
+                   :db/valueType   :db.type/keyword
+                   :db/cardinality :db.cardinality/one}
+                  {:db/ident       :location/city+state
+                   :db/valueType   :db.type/tuple
+                   :db/tupleAttrs  [:location/city :location/state]
+                   :db/cardinality :db.cardinality/one
+                   :db/unique      :db.unique/identity}]
+                 [{:location/city "Los Angeles" :location/state :CA}
+                  {:location/city "Los Angeles" :location/state :CA}
+                  {:location/city "San Francisco" :location/state :CA}]]
+    :assertions (fn [ctx]
+                  (let [dest-db (d/db (:dest-conn ctx))
+                        ;; Should only have 2 unique locations, not 3
+                        all-locations (d/q '[:find ?city ?state
+                                             :where
+                                             [?e :location/city ?city]
+                                             [?e :location/state ?state]]
+                                        dest-db)]
+                    (is (= 2 (count all-locations)))
+                    (is (contains? (set all-locations) ["Los Angeles" :CA]))
+                    (is (contains? (set all-locations) ["San Francisco" :CA]))))}
+
    {:name       "Composite tuples with renamed component attributes"
     :schema     [[{:db/ident       :course/dept
                    :db/valueType   :db.type/keyword
