@@ -553,36 +553,39 @@
   (let [source-schema-lookup (impl/q-schema-lookup source-db)
         {:keys [schema old->new-ident-lookup]} (get-schema-args source-db)
 
-        ;; Step 1: Copy schema WITHOUT tuple attributes
-        ;; We'll add these in at the end.
-        non-tuple-schema (remove :db/tupleAttrs schema)
-        _ (log/info "Copying schema (non-tuple attributes)"
+        ;; Step 1: Copy schema WITHOUT composite tuple attributes
+        ;; Composite tuples (:db/tupleAttrs) need to be added after data restore.
+        ;; Heterogeneous (:db/tupleTypes) and homogeneous (:db/tupleType) tuples
+        ;; are explicitly asserted and can be installed with the initial schema.
+        non-composite-tuple-schema (remove :db/tupleAttrs schema)
+        _ (log/info "Copying schema (non-composite tuple attributes)"
             :total-attributes (count schema)
-            :non-tuple-attributes (count non-tuple-schema))
+            :non-composite-tuple-attributes (count non-composite-tuple-schema))
         _ (copy-schema! {:dest-conn             dest-conn
-                         :schema                non-tuple-schema
+                         :schema                non-composite-tuple-schema
                          :old->new-ident-lookup old->new-ident-lookup})
         _ (log/info "Schema copy complete")
 
-        ;; Step 2: Restore data for non-tuple attributes only
-        non-tuple-attribute-eids (into []
-                                   (map (fn [{:db/keys [ident]}]
-                                          (get-in source-schema-lookup [::impl/ident->schema ident :db/id])))
-                                   non-tuple-schema)
+        ;; Step 2: Restore data for non-composite tuple attributes
+        non-composite-tuple-attribute-eids
+        (into []
+          (map (fn [{:db/keys [ident]}]
+                 (get-in source-schema-lookup [::impl/ident->schema ident :db/id])))
+          non-composite-tuple-schema)
 
         _ (log/info "Starting data restore")
         _ (-full-copy (assoc argm
-                        :attribute-eids non-tuple-attribute-eids
+                        :attribute-eids non-composite-tuple-attribute-eids
                         :schema-lookup source-schema-lookup))
         _ (log/info "Data restore complete")
 
-        ;; Step 3: Add tuple attributes and establish composite values
-        tuple-schema (filter :db/tupleAttrs schema)
-        _ (when (seq tuple-schema)
-            (log/info "Processing tuple attributes"
-              :tuple-attr-count (count tuple-schema)))
+        ;; Step 3: Add composite tuple attributes and establish their values
+        composite-tuple-schema (filter :db/tupleAttrs schema)
+        _ (when (seq composite-tuple-schema)
+            (log/info "Processing composite tuple attributes"
+              :tuple-attr-count (count composite-tuple-schema)))
         _ (add-tuple-attrs! {:dest-conn             dest-conn
-                             :tuple-schema          tuple-schema
+                             :tuple-schema          composite-tuple-schema
                              :old->new-ident-lookup old->new-ident-lookup})]
     (log/info "Current state restore complete")
     true))
