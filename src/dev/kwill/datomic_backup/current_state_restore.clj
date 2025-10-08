@@ -1,4 +1,43 @@
 (ns dev.kwill.datomic-backup.current-state-restore
+  "Current state restore for Datomic databases.
+
+  Restores a database by copying schema and current datom state (no history)
+  from a source database to a destination database.
+
+  ## Performance Tuning
+
+  The restore process has three main performance knobs:
+
+  - `:max-batch-size` (default 500) - Datoms per transaction
+    Higher = fewer transactions, faster overall
+
+  - `:read-parallelism` (default 20) - Parallel attribute reads
+    Higher = faster reads
+
+  - `:read-chunk` (default 5000) - Datoms per read chunk
+    Higher = fewer read calls
+
+  ## Performance Metrics
+
+  When `:debug true`, logs every 10 batches with these metrics:
+
+  - `:pending-count` - Datoms waiting due to ref dependencies
+    High count → increase :max-batch-size
+
+  - `:last-tx-ms` / `:avg-tx-ms` - Transaction timing
+    High values → Datomic writes are slow, may be at limit
+
+  - `:batch-efficiency` - Percentage of batch actually written
+    Low (< 80%) → increase :max-batch-size to resolve more refs
+
+  - `:utilization-pct` - Channel buffer utilization (every 10s)
+    High (> 80%) → writes are bottleneck (good!)
+    Low (< 20%) → reads are slow, increase :read-parallelism
+
+  At completion:
+  - `:avg-tx-ms` - Overall average transaction time
+  - `:final-pending-count` - Should be 0
+  - `:duration-sec` - Total time to read all datoms"
   (:require
     [dev.kwill.datomic-backup.impl :as impl]
     [datomic.client.api :as d]
@@ -110,7 +149,8 @@
                        :old-id->new-id    {}
                        :tx-count          0
                        :tx-datom-count    0
-                       :tx-eids           #{}}}}]
+                       :tx-eids           #{}
+                       :total-tx-time-ms  0}}}]
   (reduce
     (fn [{:keys [old-id->new-id] :as acc} batch]
       (let [{:keys [old-id->tempid
@@ -120,7 +160,8 @@
             (txify-datoms batch (:pending acc) eid->schema old-id->new-id)]
         (assoc
           (if (seq tx-data)
-            (let [{:keys [tempids
+            (let [tx-start (System/currentTimeMillis)
+                  {:keys [tempids
                           tx-data]} (try
                                       #_(transact-with-max-batch-size dest-conn {:tx-data tx-data} max-batch-size)
                                       (retry/with-retry #(d/transact dest-conn {:tx-data tx-data})
@@ -128,6 +169,7 @@
                                                     {:max-retries 20})})
                                       (catch Exception ex
                                         (throw ex)))
+                  tx-duration (- (System/currentTimeMillis) tx-start)
                   next-old-id->new-id (into old-id->new-id
                                         (map (fn [[old-id tempid]]
                                                (when-let [eid (get tempids tempid)]
@@ -139,11 +181,16 @@
                              (update :input-datom-count (fnil + 0) (count batch))
                              (update :tx-count (fnil inc 0))
                              (update :tx-datom-count (fnil + 0) (count tx-data))
-                             (update :tx-eids sets/union tx-eids))]
+                             (update :tx-eids sets/union tx-eids)
+                             (update :total-tx-time-ms (fnil + 0) tx-duration))]
               (when (and debug (zero? (mod (:tx-count next-acc) 10)))
-                (log/debug "Batch complete"
+                (log/info "Batch progress"
+                  :tx-count (:tx-count next-acc)
                   :tx-datom-count (:tx-datom-count next-acc)
-                  :tx-count (:tx-count next-acc)))
+                  :pending-count (count pending)
+                  :last-tx-ms tx-duration
+                  :avg-tx-ms (int (/ (:total-tx-time-ms next-acc) (:tx-count next-acc)))
+                  :batch-efficiency (format "%.1f%%" (* 100.0 (/ (count tx-data) (count batch))))))
               ;(prn 'batch batch)
               ;(prn 'tx-data tx-data)
               ;(prn 'old-id->tempid old-id->tempid)
@@ -207,7 +254,8 @@
 (defn read-datoms-in-parallel-sync2
   [source-db {:keys [attribute-eids dest-ch parallelism read-chunk]}]
   (let [exec (Executors/newFixedThreadPool parallelism)
-        done-ch (async/chan)]
+        done-ch (async/chan)
+        start-time (System/currentTimeMillis)]
     (doseq [a attribute-eids]
       (.submit exec ^Runnable
         (fn []
@@ -225,7 +273,13 @@
         (log/debug "Done reading attr." :attrid attr))
       (if (< (inc n) (count attribute-eids))
         (recur (inc n))
-        (do (async/close! dest-ch) (async/thread (.shutdown exec)))))
+        (let [duration (- (System/currentTimeMillis) start-time)]
+          (log/info "All attributes read complete"
+            :total-attributes (count attribute-eids)
+            :duration-ms duration
+            :duration-sec (int (/ duration 1000)))
+          (async/close! dest-ch)
+          (async/thread (.shutdown exec)))))
     dest-ch))
 
 (defn anom!
@@ -291,10 +345,10 @@
       (let [buf (.buf ch)
             cur (.count buf)
             total (.n buf)]
-        (log/debug (str channel-name " channel, reporting in...")
+        (log/info (str channel-name " channel status")
           :current-size cur
           :total-size total
-          :perc (format "%.3f" (double (* 100 (/ cur total)))))
+          :utilization-pct (format "%.1f%%" (* 100.0 (/ cur total))))
         (Thread/sleep every-ms))))
   ch)
 
@@ -308,6 +362,10 @@
            read-chunk
            init-state
            attribute-eids]}]
+  (log/info "Starting datom read"
+    :parallelism read-parallelism
+    :chunk-size read-chunk
+    :attribute-count (count attribute-eids))
   (let [*running? (atom true)
         datoms (let [ch (cond-> (async/chan 20000)
                           debug
@@ -332,12 +390,20 @@
                                 (<= tx max-bootstrap-tx))))
                     (partition-all max-batch-size)))]
     (try
-      (copy-datoms
-        (cond-> {:dest-conn     dest-conn
-                 :datom-batches batches
-                 :eid->schema   eid->schema}
-          debug (assoc :debug debug)
-          init-state (assoc :init-state init-state)))
+      (let [result (copy-datoms (cond-> {:dest-conn     dest-conn
+                                         :datom-batches batches
+                                         :eid->schema   eid->schema}
+                                  debug (assoc :debug debug)
+                                  init-state (assoc :init-state init-state)))]
+        (log/info "Data copy complete"
+          :total-transactions (:tx-count result)
+          :total-datoms (:tx-datom-count result)
+          :entities-created (count (:old-id->new-id result))
+          :avg-tx-ms (if (pos? (:tx-count result))
+                       (int (/ (:total-tx-time-ms result) (:tx-count result)))
+                       0)
+          :final-pending-count (count (:pending result)))
+        result)
       ;(catch Exception ex (sc.api/spy) (throw ex))
       (finally (reset! *running? false)))))
 
@@ -418,13 +484,18 @@
   [{:keys [dest-conn schema old->new-ident-lookup]}]
   (let [new->old-ident-lookup (sets/map-invert old->new-ident-lookup)
         waves (partition-schema-by-deps schema)]
-    (doseq [wave waves]
+    (log/info "Installing schema"
+      :total-attributes (count schema)
+      :waves (count waves))
+    (doseq [[wave-idx wave] (map-indexed vector waves)]
       (let [renamed-in-wave (keep (fn [attr]
                                     (when-let [old-ident (new->old-ident-lookup (:db/ident attr))]
                                       [(:db/ident attr) old-ident]))
                               wave)
             renamed-map (into {} renamed-in-wave)]
-
+        (log/info "Installing schema wave"
+          :wave (inc wave-idx)
+          :attributes (count wave))
         (if (seq renamed-map)
           (do
             (let [wave-with-old-idents (mapv (fn [attr]
@@ -468,7 +539,7 @@
       :tuple-attr-count (count tuple-schema))
     (doseq [tuple-attr tuple-schema]
       (doseq [component-attr (:db/tupleAttrs tuple-attr)]
-        (log/debug "Reasserting component attribute for tuple"
+        (log/info "Reasserting component attribute for tuple"
           :tuple-attr (:db/ident tuple-attr)
           :component-attr component-attr)
         (establish-composite! dest-conn
@@ -478,15 +549,20 @@
 
 (defn restore
   [{:keys [source-db dest-conn] :as argm}]
+  (log/info "Starting current state restore")
   (let [source-schema-lookup (impl/q-schema-lookup source-db)
         {:keys [schema old->new-ident-lookup]} (get-schema-args source-db)
 
         ;; Step 1: Copy schema WITHOUT tuple attributes
         ;; We'll add these in at the end.
         non-tuple-schema (remove :db/tupleAttrs schema)
+        _ (log/info "Copying schema (non-tuple attributes)"
+            :total-attributes (count schema)
+            :non-tuple-attributes (count non-tuple-schema))
         _ (copy-schema! {:dest-conn             dest-conn
                          :schema                non-tuple-schema
                          :old->new-ident-lookup old->new-ident-lookup})
+        _ (log/info "Schema copy complete")
 
         ;; Step 2: Restore data for non-tuple attributes only
         non-tuple-attribute-eids (into []
@@ -494,14 +570,21 @@
                                           (get-in source-schema-lookup [::impl/ident->schema ident :db/id])))
                                    non-tuple-schema)
 
+        _ (log/info "Starting data restore")
         _ (-full-copy (assoc argm
                         :attribute-eids non-tuple-attribute-eids
                         :schema-lookup source-schema-lookup))
+        _ (log/info "Data restore complete")
 
         ;; Step 3: Add tuple attributes and establish composite values
+        tuple-schema (filter :db/tupleAttrs schema)
+        _ (when (seq tuple-schema)
+            (log/info "Processing tuple attributes"
+              :tuple-attr-count (count tuple-schema)))
         _ (add-tuple-attrs! {:dest-conn             dest-conn
-                             :tuple-schema          (filter :db/tupleAttrs schema)
+                             :tuple-schema          tuple-schema
                              :old->new-ident-lookup old->new-ident-lookup})]
+    (log/info "Current state restore complete")
     true))
 
 (comment (sc.api/defsc 1)
