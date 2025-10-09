@@ -396,13 +396,16 @@
                    (ch->seq)))
         eid->schema (::impl/eid->schema schema-lookup)
         ident->schema (::impl/ident->schema schema-lookup)
+        ;; TODO: add support for Entity Specs
+        ignored-attrs #{:db.install/attribute :db/ensure}
+        ignored-attr-eids (set (map #(get-in ident->schema [% :db/id]) ignored-attrs))
         batches (let [max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
                       schema-ids (into #{} (map key) eid->schema)]
                   (->> datoms
                     (remove (fn [[e a _ tx]]
                               (or
                                 (contains? schema-ids e)
-                                (= (get-in ident->schema [:db.install/attribute :db/id]) a)
+                                (contains? ignored-attr-eids a)
                                 (<= tx max-bootstrap-tx))))
                     (partition-all max-batch-size)))]
     (try
