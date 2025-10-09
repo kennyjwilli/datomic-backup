@@ -39,15 +39,15 @@
   - `:final-pending-count` - Should be 0
   - `:duration-sec` - Total time to read all datoms"
   (:require
-    [dev.kwill.datomic-backup.impl :as impl]
+    [clojure.core.async :as async]
+    [clojure.set :as sets]
+    [clojure.tools.logging :as log]
+    [clojure.walk :as walk]
     [datomic.client.api :as d]
     [datomic.client.api.async :as d.a]
-    [clojure.set :as sets]
-    [clojure.walk :as walk]
-    [clojure.tools.logging :as log]
+    [dev.kwill.datomic-backup.impl :as impl]
     [dev.kwill.datomic-backup.retry :as retry]
-    [clojure.core.async :as async]
-    [clojure.string :as str])
+    [sc.api])
   (:import (clojure.lang ExceptionInfo)
            (java.util.concurrent Executors)))
 
@@ -96,7 +96,7 @@
 ;;    2) eid will be transacted in this transaction. only true if
 
 (defn txify-datoms
-  [datoms pending eid->schema old-id->new-id]
+  [datoms pending eid->schema old-id->new-id newly-created-eids]
   (let [;; an attempt to add a tuple or ref value pointing to an eid NOT in this
         ;; set should be attempted later
         eids-exposed (into (set (keys old-id->new-id))
@@ -107,7 +107,15 @@
                                      (get-in eid->schema [a :db/valueType]))))
                          (map :e))
                        datoms)
-        datoms-and-pending (concat datoms (map :datom pending))]
+        ;; Update pending datoms to track what they're still waiting for
+        ;; and retry any whose dependencies are now satisfied
+        retryable-pending (into []
+                            (comp
+                              (map (fn [{:keys [required-eids] :as p}]
+                                     (assoc p :waiting-for (sets/difference required-eids eids-exposed))))
+                              (filter (fn [{:keys [waiting-for]}] (empty? waiting-for))))
+                            pending)
+        datoms-and-pending (concat datoms (map :datom retryable-pending))]
     (reduce (fn [acc [e a v :as datom]]
               (if (= :db/txInstant (get-in eid->schema [a :db/ident]))
                 ;; not actually used, only collected for reporting purposes
@@ -116,12 +124,15 @@
                               required-eids
                               resolved-e-id]
                        :as   resolved} (resolve-datom datom eid->schema old-id->new-id)
-                      can-include? (sets/subset? required-eids eids-exposed)]
+                      can-include? (sets/subset? required-eids eids-exposed)
+                      waiting-for (sets/difference required-eids eids-exposed)]
                   (cond-> acc
                     can-include?
                     (update :tx-data (fnil conj []) tx)
                     (not can-include?)
-                    (update :pending (fnil conj []) (assoc resolved :datom datom))
+                    (update :pending (fnil conj []) (assoc resolved
+                                                      :datom datom
+                                                      :waiting-for waiting-for))
                     (string? resolved-e-id)
                     (assoc-in [:old-id->tempid e] resolved-e-id)))))
       {} datoms-and-pending)))
@@ -145,19 +156,20 @@
 
 (defn copy-datoms
   [{:keys [dest-conn datom-batches eid->schema init-state debug]
-    :or   {init-state {:input-datom-count 0
-                       :old-id->new-id    {}
-                       :tx-count          0
-                       :tx-datom-count    0
-                       :tx-eids           #{}
-                       :total-tx-time-ms  0}}}]
+    :or   {init-state {:input-datom-count  0
+                       :old-id->new-id     {}
+                       :tx-count           0
+                       :tx-datom-count     0
+                       :tx-eids            #{}
+                       :total-tx-time-ms   0
+                       :newly-created-eids #{}}}}]
   (reduce
-    (fn [{:keys [old-id->new-id] :as acc} batch]
+    (fn [{:keys [old-id->new-id newly-created-eids] :as acc} batch]
       (let [{:keys [old-id->tempid
                     tx-data
                     tx-eids
                     pending]}
-            (txify-datoms batch (:pending acc) eid->schema old-id->new-id)]
+            (txify-datoms batch (:pending acc) eid->schema old-id->new-id newly-created-eids)]
         (assoc
           (if (seq tx-data)
             (let [tx-start (System/currentTimeMillis)
@@ -168,6 +180,7 @@
                                         {:backoff (retry/capped-exponential-backoff-with-jitter
                                                     {:max-retries 20})})
                                       (catch Exception ex
+                                        (sc.api/spy)
                                         (throw ex)))
                   tx-duration (- (System/currentTimeMillis) tx-start)
                   next-old-id->new-id (into old-id->new-id
@@ -175,9 +188,12 @@
                                                (when-let [eid (get tempids tempid)]
                                                  [old-id eid])))
                                         old-id->tempid)
+                  ;; Track which old entity IDs were just created in this transaction
+                  next-newly-created-eids (into #{} (map first) old-id->tempid)
                   next-acc (-> acc
                              (assoc
-                               :old-id->new-id next-old-id->new-id)
+                               :old-id->new-id next-old-id->new-id
+                               :newly-created-eids next-newly-created-eids)
                              (update :input-datom-count (fnil + 0) (count batch))
                              (update :tx-count (fnil inc 0))
                              (update :tx-datom-count (fnil + 0) (count tx-data))
@@ -480,6 +496,27 @@
           :added added)
         (Thread/sleep (* 1000 pacing-sec))))))
 
+(defn establish-composite-tuple!
+  "Establishes composite tuple values by reasserting one component attribute
+  for each entity. Datomic automatically creates the full composite tuple when
+  any component is reasserted, so we only need to reassert the first component."
+  [conn {:keys [tuple-attr-schema]}]
+  (let [component-attrs (:db/tupleAttrs tuple-attr-schema)
+        db (d/db conn)
+        ;; Use the first component attribute to find all entities
+        first-component (first component-attrs)
+        ;; Get all entities that have the first component attribute
+        entities (d/datoms db {:index      :aevt
+                               :components [first-component]
+                               :limit      -1})]
+    (reduce
+      (fn [acc {:keys [e v]}]
+        ;; Reassert only the first component - Datomic will create the full tuple
+        (retry/with-retry #(d/transact conn {:tx-data [[:db/add e first-component v]]}))
+        (update acc :success inc))
+      {:success 0 :skipped 0}
+      entities)))
+
 (defn copy-schema!
   [{:keys [dest-conn schema old->new-ident-lookup]}]
   (let [new->old-ident-lookup (sets/map-invert old->new-ident-lookup)
@@ -538,14 +575,16 @@
     (log/info "Establishing composite tuple values"
       :tuple-attr-count (count tuple-schema))
     (doseq [tuple-attr tuple-schema]
-      (doseq [component-attr (:db/tupleAttrs tuple-attr)]
-        (log/info "Reasserting component attribute for tuple"
+      (log/info "Establishing tuple values"
+        :tuple-attr (:db/ident tuple-attr)
+        :component-attrs (:db/tupleAttrs tuple-attr))
+      (let [results (establish-composite-tuple! dest-conn
+                      {:tuple-attr-schema tuple-attr
+                       :batch-size        500})]
+        (log/info "Composite tuple establishment complete"
           :tuple-attr (:db/ident tuple-attr)
-          :component-attr component-attr)
-        (establish-composite! dest-conn
-          {:attr       component-attr
-           :batch-size 500
-           :pacing-sec 0})))))
+          :success (:success results)
+          :skipped (:skipped results))))))
 
 (defn restore
   [{:keys [source-db dest-conn] :as argm}]
