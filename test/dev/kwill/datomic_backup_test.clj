@@ -73,21 +73,23 @@
                     (is (= [:cs 201] (:course/id cs201)))
                     (is (= [:math 101] (:course/id math101)))))}
 
-   {:name       "Composite tuples with duplicate component values"
+   {:name       "Composite tuples added after data"
     :schema     [[{:db/ident       :location/city
                    :db/valueType   :db.type/string
                    :db/cardinality :db.cardinality/one}
                   {:db/ident       :location/state
                    :db/valueType   :db.type/keyword
-                   :db/cardinality :db.cardinality/one}
-                  {:db/ident       :location/city+state
+                   :db/cardinality :db.cardinality/one}]
+                 ;; Add data BEFORE tuple is defined - multiple entities can have same values
+                 [{:location/city "Los Angeles" :location/state :CA}
+                  {:location/city "Los Angeles" :location/state :CA}
+                  {:location/city "San Francisco" :location/state :CA}]
+                 ;; NOW add the composite tuple
+                 [{:db/ident       :location/city+state
                    :db/valueType   :db.type/tuple
                    :db/tupleAttrs  [:location/city :location/state]
                    :db/cardinality :db.cardinality/one
-                   :db/unique      :db.unique/identity}]
-                 [{:location/city "Los Angeles" :location/state :CA}
-                  {:location/city "Los Angeles" :location/state :CA}
-                  {:location/city "San Francisco" :location/state :CA}]]
+                   :db/unique      :db.unique/identity}]]
     :assertions (fn [ctx]
                   (let [dest-db (d/db (:dest-conn ctx))
                         ;; Should only have 2 unique locations, not 3
