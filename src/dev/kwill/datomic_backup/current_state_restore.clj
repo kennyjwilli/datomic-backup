@@ -196,105 +196,89 @@
             (assoc :db-before db-before))))
       {} batches)))
 
-(defn copy-datoms
-  [{:keys [dest-conn datom-batches eid->schema init-state debug]
-    :or   {init-state {:input-datom-count  0
-                       :old-id->new-id     {}
-                       :tx-count           0
-                       :tx-datom-count     0
-                       :tx-eids            #{}
-                       :total-tx-time-ms   0
-                       :newly-created-eids #{}
-                       :pending-index      {}}}}]
-  (reduce
-    (fn [{:keys [old-id->new-id newly-created-eids pending-index] :as acc} batch]
-      (let [{:keys [old-id->tempid
-                    tx-data
-                    tx-eids
-                    pending-datoms]}
-            (txify-datoms batch pending-index eid->schema old-id->new-id newly-created-eids)]
+(defn process-single-batch
+  "Process a single batch of datoms, updating the accumulator state."
+  [{:keys [old-id->new-id newly-created-eids pending-index dest-conn eid->schema debug] :as acc}
+   batch]
+  (let [{:keys [old-id->tempid
+                tx-data
+                tx-eids
+                pending-datoms]}
+        (txify-datoms batch pending-index eid->schema old-id->new-id newly-created-eids)]
 
-        ;; Diagnostic: Log when we're not making progress
-        (when (and debug
-                (empty? tx-data)
-                (seq batch))
-          (let [total-pending (reduce + (map count (vals pending-index)))]
-            (log/warn "Batch produced no transactions!"
-              :batch-size (count batch)
-              :total-pending total-pending
-              :prev-pending-count (reduce + (map count (vals (:pending-index acc))))
-              :batch-first-3 (take 3 batch))))
+    ;; Diagnostic: Log when we're not making progress
+    (when (and debug
+            (empty? tx-data)
+            (seq batch))
+      (let [total-pending (reduce + (map count (vals pending-index)))]
+        (log/warn "Batch produced no transactions!"
+          :batch-size (count batch)
+          :total-pending total-pending
+          :prev-pending-count (reduce + (map count (vals (:pending-index acc))))
+          :batch-first-3 (take 3 batch))))
 
-        ;; Diagnostic: Detect stuck state - same pending count for multiple batches
-        (when (and debug
-                (let [cur-pending (reduce + (map count (vals pending-index)))
-                      prev-pending (reduce + (map count (vals (:pending-index acc))))]
-                  (and (= cur-pending prev-pending)
-                    (pos? cur-pending)
-                    (empty? tx-data))))
-          (let [total-pending (reduce + (map count (vals pending-index)))]
-            (log/error "STUCK: Same pending count, no progress!"
-              :pending-count total-pending
-              :tx-count (:tx-count acc)
-              :first-pending-datom (first (mapcat identity (vals pending-index))))))
+    ;; Diagnostic: Detect stuck state - same pending count for multiple batches
+    (when (and debug
+            (let [cur-pending (reduce + (map count (vals pending-index)))
+                  prev-pending (reduce + (map count (vals (:pending-index acc))))]
+              (and (= cur-pending prev-pending)
+                (pos? cur-pending)
+                (empty? tx-data))))
+      (let [total-pending (reduce + (map count (vals pending-index)))]
+        (log/error "STUCK: Same pending count, no progress!"
+          :pending-count total-pending
+          :tx-count (:tx-count acc)
+          :first-pending-datom (first (mapcat identity (vals pending-index))))))
 
-        (assoc
-          (if (seq tx-data)
-            (let [tx-start (System/currentTimeMillis)
-                  {:keys [tempids
-                          tx-data]} (try
-                                      #_(transact-with-max-batch-size dest-conn {:tx-data tx-data} max-batch-size)
-                                      (retry/with-retry #(d/transact dest-conn {:tx-data tx-data})
-                                        {:backoff (retry/capped-exponential-backoff-with-jitter
-                                                    {:max-retries 20})})
-                                      (catch Exception ex
-                                        (sc.api/spy)
-                                        (throw ex)))
-                  tx-duration (- (System/currentTimeMillis) tx-start)
-                  next-old-id->new-id (into old-id->new-id
-                                        (map (fn [[old-id tempid]]
-                                               (when-let [eid (get tempids tempid)]
-                                                 [old-id eid])))
-                                        old-id->tempid)
-                  ;; Track which old entity IDs were just created in this transaction
-                  next-newly-created-eids (into #{} (map first) old-id->tempid)
-                  next-acc (-> acc
-                             (assoc
-                               :old-id->new-id next-old-id->new-id
-                               :newly-created-eids next-newly-created-eids)
-                             (update :input-datom-count (fnil + 0) (count batch))
-                             (update :tx-count (fnil inc 0))
-                             (update :tx-datom-count (fnil + 0) (count tx-data))
-                             (update :tx-eids sets/union tx-eids)
-                             (update :total-tx-time-ms (fnil + 0) tx-duration))]
-              (when (and debug (zero? (mod (:tx-count next-acc) 10)))
-                (let [total-pending (reduce + (map count (vals pending-index)))]
-                  (log/info "Batch progress"
-                    :tx-count (:tx-count next-acc)
-                    :tx-datom-count (:tx-datom-count next-acc)
-                    :pending-count total-pending
-                    :last-tx-ms tx-duration
-                    :avg-tx-ms (int (/ (:total-tx-time-ms next-acc) (:tx-count next-acc)))
-                    :batch-efficiency (format "%.1f%%" (* 100.0 (/ (count tx-data) (+ (count batch) (count pending-datoms))))))))
-              ;(prn 'batch batch)
-              ;(prn 'tx-data tx-data)
-              ;(prn 'old-id->tempid old-id->tempid)
-              ;(prn 'tempids tempids)
-              ;(prn 'next-old-id->new-id next-old-id->new-id)
-              ;(prn '---)
-              next-acc)
-            acc)
-          ;; Build pending index: map from required-eid to pending datoms that need it
-          :pending-index (reduce
-                           (fn [idx {:keys [required-eids] :as pending-datom}]
-                             (reduce
-                               (fn [idx eid]
-                                 (update idx eid (fnil conj []) pending-datom))
-                               idx
-                               required-eids))
-                           {}
-                           pending-datoms))))
-    init-state datom-batches))
+    (assoc
+      (if (seq tx-data)
+        (let [tx-start (System/currentTimeMillis)
+              {:keys [tempids
+                      tx-data]} (try
+                                  (retry/with-retry #(d/transact dest-conn {:tx-data tx-data})
+                                    {:backoff (retry/capped-exponential-backoff-with-jitter
+                                                {:max-retries 20})})
+                                  (catch Exception ex
+                                    (sc.api/spy)
+                                    (throw ex)))
+              tx-duration (- (System/currentTimeMillis) tx-start)
+              next-old-id->new-id (into old-id->new-id
+                                    (map (fn [[old-id tempid]]
+                                           (when-let [eid (get tempids tempid)]
+                                             [old-id eid])))
+                                    old-id->tempid)
+              ;; Track which old entity IDs were just created in this transaction
+              next-newly-created-eids (into #{} (map first) old-id->tempid)
+              next-acc (-> acc
+                         (assoc
+                           :old-id->new-id next-old-id->new-id
+                           :newly-created-eids next-newly-created-eids)
+                         (update :input-datom-count (fnil + 0) (count batch))
+                         (update :tx-count (fnil inc 0))
+                         (update :tx-datom-count (fnil + 0) (count tx-data))
+                         (update :tx-eids sets/union tx-eids)
+                         (update :total-tx-time-ms (fnil + 0) tx-duration))]
+          (when (and debug (zero? (mod (:tx-count next-acc) 10)))
+            (let [total-pending (reduce + (map count (vals pending-index)))]
+              (log/info "Batch progress"
+                :tx-count (:tx-count next-acc)
+                :tx-datom-count (:tx-datom-count next-acc)
+                :pending-count total-pending
+                :last-tx-ms tx-duration
+                :avg-tx-ms (int (/ (:total-tx-time-ms next-acc) (:tx-count next-acc)))
+                :batch-efficiency (format "%.1f%%" (* 100.0 (/ (count tx-data) (+ (count batch) (count pending-datoms))))))))
+          next-acc)
+        acc)
+      ;; Build pending index: map from required-eid to pending datoms that need it
+      :pending-index (reduce
+                       (fn [idx {:keys [required-eids] :as pending-datom}]
+                         (reduce
+                           (fn [idx eid]
+                             (update idx eid (fnil conj []) pending-datom))
+                           idx
+                           required-eids))
+                       {}
+                       pending-datoms))))
 
 (comment (sc.api/defsc 1))
 
@@ -427,12 +411,6 @@
       in-ch)
     dest-ch))
 
-(defn ch->seq
-  [ch]
-  (if-let [v (<anom!! ch)]
-    (lazy-seq (cons v (ch->seq ch)))
-    nil))
-
 (defn monitored-chan!
   [ch {:keys [runningf channel-name every-ms]
        :or   {every-ms 10000}}]
@@ -463,43 +441,58 @@
     :chunk-size read-chunk
     :attribute-count (count attribute-eids))
   (let [*running? (atom true)
-        datoms (let [ch (cond-> (async/chan 20000)
-                          debug
-                          (monitored-chan! {:runningf     #(deref *running?)
-                                            :channel-name "datoms"}))]
-                 (-> source-db
-                   (read-datoms-in-parallel-sync2
-                     {:attribute-eids attribute-eids
-                      :parallelism    read-parallelism
-                      :dest-ch        ch
-                      :read-chunk     read-chunk})
-                   (ch->seq)))
+        ch (cond-> (async/chan 20000)
+             debug
+             (monitored-chan! {:runningf     #(deref *running?)
+                               :channel-name "datoms"}))
+        _ (read-datoms-in-parallel-sync2 source-db
+            {:attribute-eids attribute-eids
+             :parallelism    read-parallelism
+             :dest-ch        ch
+             :read-chunk     read-chunk})
         eid->schema (::impl/eid->schema schema-lookup)
-        batches (let [max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
-                      schema-ids (into #{} (map key) eid->schema)]
-                  (->> datoms
-                    (remove (fn [[e _ _ tx]]
-                              (or
-                                (contains? schema-ids e)
-                                (<= tx max-bootstrap-tx))))
-                    (partition-all max-batch-size)))]
+        max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
+        schema-ids (into #{} (map key) eid->schema)
+        init-state (merge {:input-datom-count  0
+                           :old-id->new-id     {}
+                           :tx-count           0
+                           :tx-datom-count     0
+                           :tx-eids            #{}
+                           :total-tx-time-ms   0
+                           :newly-created-eids #{}
+                           :pending-index      {}
+                           :dest-conn          dest-conn
+                           :eid->schema        eid->schema
+                           :debug              debug}
+                     init-state)]
     (try
-      (let [result (copy-datoms (cond-> {:dest-conn     dest-conn
-                                         :datom-batches batches
-                                         :eid->schema   eid->schema}
-                                  debug (assoc :debug debug)
-                                  init-state (assoc :init-state init-state)))
-            final-pending-count (reduce + (map count (vals (:pending-index result))))]
-        (log/info "Data copy complete"
-          :total-transactions (:tx-count result)
-          :total-datoms (:tx-datom-count result)
-          :entities-created (count (:old-id->new-id result))
-          :avg-tx-ms (if (pos? (:tx-count result))
-                       (int (/ (:total-tx-time-ms result) (:tx-count result)))
-                       0)
-          :final-pending-count final-pending-count)
-        result)
-      ;(catch Exception ex (sc.api/spy) (throw ex))
+      (loop [acc init-state
+             batch []]
+        (if-let [datom (<anom!! ch)]
+          (let [[e _ _ tx] datom]
+            ;; Skip bootstrap/schema datoms
+            (if (or (contains? schema-ids e) (<= tx max-bootstrap-tx))
+              (recur acc batch)
+              ;; Accumulate batch
+              (if (< (count batch) max-batch-size)
+                (recur acc (conj batch datom))
+                ;; Batch is full, process it and start new batch with current datom
+                (let [next-acc (process-single-batch acc batch)]
+                  (recur next-acc [datom])))))
+          ;; Channel closed, process final batch if non-empty
+          (let [final-acc (if (seq batch)
+                            (process-single-batch acc batch)
+                            acc)
+                final-pending-count (reduce + (map count (vals (:pending-index final-acc))))]
+            (log/info "Data copy complete"
+              :total-transactions (:tx-count final-acc)
+              :total-datoms (:tx-datom-count final-acc)
+              :entities-created (count (:old-id->new-id final-acc))
+              :avg-tx-ms (if (pos? (:tx-count final-acc))
+                           (int (/ (:total-tx-time-ms final-acc) (:tx-count final-acc)))
+                           0)
+              :final-pending-count final-pending-count)
+            final-acc)))
       (finally (reset! *running? false)))))
 
 (defn partition-schema-by-deps
@@ -808,12 +801,12 @@
 
         _ (log/info "Starting data restore" :two-pass? two-pass?)
         result (if two-pass?
-                  (restore-two-pass (assoc argm
-                                      :attribute-eids non-composite-tuple-attribute-eids
-                                      :schema-lookup source-schema-lookup))
-                  (-full-copy (assoc argm
-                                :attribute-eids non-composite-tuple-attribute-eids
-                                :schema-lookup source-schema-lookup)))
+                 (restore-two-pass (assoc argm
+                                     :attribute-eids non-composite-tuple-attribute-eids
+                                     :schema-lookup source-schema-lookup))
+                 (-full-copy (assoc argm
+                               :attribute-eids non-composite-tuple-attribute-eids
+                               :schema-lookup source-schema-lookup)))
         _ (log/info "Data restore complete" :result result)
 
         composite-tuple-schema (filter :db/tupleAttrs schema)
