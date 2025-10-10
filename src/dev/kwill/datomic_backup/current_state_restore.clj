@@ -96,7 +96,7 @@
 ;;    2) eid will be transacted in this transaction. only true if
 
 (defn txify-datoms
-  [datoms pending eid->schema old-id->new-id newly-created-eids]
+  [datoms pending-index eid->schema old-id->new-id newly-created-eids]
   (let [;; an attempt to add a tuple or ref value pointing to an eid NOT in this
         ;; set should be attempted later
         eids-exposed (into (set (keys old-id->new-id))
@@ -107,6 +107,14 @@
                                      (get-in eid->schema [a :db/valueType]))))
                          (map :e))
                        datoms)
+
+        ;; Only check pending datoms whose required EIDs were just exposed
+        ;; This avoids the O(n*m) overhead of scanning all pending every batch
+        newly-exposed-eids (sets/difference eids-exposed (set (keys old-id->new-id)))
+        potentially-ready-pending (into []
+                                    (mapcat (fn [eid] (get pending-index eid)))
+                                    newly-exposed-eids)
+
         ;; Update pending datoms to track what they're still waiting for
         ;; and retry any whose dependencies are now satisfied
         retryable-pending (into []
@@ -114,18 +122,20 @@
                               (map (fn [{:keys [required-eids] :as p}]
                                      (assoc p :waiting-for (sets/difference required-eids eids-exposed))))
                               (filter (fn [{:keys [waiting-for]}] (empty? waiting-for))))
-                            pending)
+                            potentially-ready-pending)
         datoms-and-pending (concat datoms (map :datom retryable-pending))]
 
     ;; Diagnostic: Log detailed info about pending resolution
-    (when (and (seq pending) (< (count retryable-pending) (count pending)))
-      (let [still-pending (- (count pending) (count retryable-pending))
+    (when (and (seq pending-index) (< (count retryable-pending) (count potentially-ready-pending)))
+      (let [total-pending (reduce + (map count (vals pending-index)))
+            still-pending (- (count potentially-ready-pending) (count retryable-pending))
             sample-stuck (first (remove (fn [{:keys [waiting-for]}] (empty? waiting-for))
                                   (map (fn [{:keys [required-eids] :as p}]
                                          (assoc p :waiting-for (sets/difference required-eids eids-exposed)))
-                                    pending)))]
+                                    potentially-ready-pending)))]
         (log/info "Pending datom analysis"
-          :total-pending (count pending)
+          :total-pending total-pending
+          :checked-pending (count potentially-ready-pending)
           :retryable (count retryable-pending)
           :still-waiting still-pending
           :eids-exposed-count (count eids-exposed)
@@ -147,9 +157,10 @@
                     can-include?
                     (update :tx-data (fnil conj []) tx)
                     (not can-include?)
-                    (update :pending (fnil conj []) (assoc resolved
-                                                      :datom datom
-                                                      :waiting-for waiting-for))
+                    (update :pending-datoms (fnil conj []) (assoc resolved
+                                                             :datom datom
+                                                             :waiting-for waiting-for
+                                                             :required-eids required-eids))
                     (string? resolved-e-id)
                     (assoc-in [:old-id->tempid e] resolved-e-id)))))
       {} datoms-and-pending)))
@@ -179,35 +190,39 @@
                        :tx-datom-count     0
                        :tx-eids            #{}
                        :total-tx-time-ms   0
-                       :newly-created-eids #{}}}}]
+                       :newly-created-eids #{}
+                       :pending-index      {}}}}]
   (reduce
-    (fn [{:keys [old-id->new-id newly-created-eids] :as acc} batch]
+    (fn [{:keys [old-id->new-id newly-created-eids pending-index] :as acc} batch]
       (let [{:keys [old-id->tempid
                     tx-data
                     tx-eids
-                    pending]}
-            (txify-datoms batch (:pending acc) eid->schema old-id->new-id newly-created-eids)]
+                    pending-datoms]}
+            (txify-datoms batch pending-index eid->schema old-id->new-id newly-created-eids)]
 
         ;; Diagnostic: Log when we're not making progress
         (when (and debug
                 (empty? tx-data)
                 (seq batch))
-          (log/warn "Batch produced no transactions!"
-            :batch-size (count batch)
-            :pending-count (count pending)
-            :prev-pending-count (count (:pending acc))
-            :batch-first-3 (take 3 batch)))
+          (let [total-pending (reduce + (map count (vals pending-index)))]
+            (log/warn "Batch produced no transactions!"
+              :batch-size (count batch)
+              :total-pending total-pending
+              :prev-pending-count (reduce + (map count (vals (:pending-index acc))))
+              :batch-first-3 (take 3 batch))))
 
         ;; Diagnostic: Detect stuck state - same pending count for multiple batches
         (when (and debug
-                (= (count pending) (count (:pending acc)))
-                (pos? (count pending))
-                (empty? tx-data))
-          (log/error "STUCK: Same pending count, no progress!"
-            :pending-count (count pending)
-            :tx-count (:tx-count acc)
-            :first-pending-datom (first (map :datom pending))
-            :first-pending-waiting-for (first (map :waiting-for pending))))
+                (let [cur-pending (reduce + (map count (vals pending-index)))
+                      prev-pending (reduce + (map count (vals (:pending-index acc))))]
+                  (and (= cur-pending prev-pending)
+                    (pos? cur-pending)
+                    (empty? tx-data))))
+          (let [total-pending (reduce + (map count (vals pending-index)))]
+            (log/error "STUCK: Same pending count, no progress!"
+              :pending-count total-pending
+              :tx-count (:tx-count acc)
+              :first-pending-datom (first (mapcat identity (vals pending-index))))))
 
         (assoc
           (if (seq tx-data)
@@ -239,13 +254,14 @@
                              (update :tx-eids sets/union tx-eids)
                              (update :total-tx-time-ms (fnil + 0) tx-duration))]
               (when (and debug (zero? (mod (:tx-count next-acc) 10)))
-                (log/info "Batch progress"
-                  :tx-count (:tx-count next-acc)
-                  :tx-datom-count (:tx-datom-count next-acc)
-                  :pending-count (count pending)
-                  :last-tx-ms tx-duration
-                  :avg-tx-ms (int (/ (:total-tx-time-ms next-acc) (:tx-count next-acc)))
-                  :batch-efficiency (format "%.1f%%" (* 100.0 (/ (count tx-data) (count batch))))))
+                (let [total-pending (reduce + (map count (vals pending-index)))]
+                  (log/info "Batch progress"
+                    :tx-count (:tx-count next-acc)
+                    :tx-datom-count (:tx-datom-count next-acc)
+                    :pending-count total-pending
+                    :last-tx-ms tx-duration
+                    :avg-tx-ms (int (/ (:total-tx-time-ms next-acc) (:tx-count next-acc)))
+                    :batch-efficiency (format "%.1f%%" (* 100.0 (/ (count tx-data) (+ (count batch) (count pending-datoms))))))))
               ;(prn 'batch batch)
               ;(prn 'tx-data tx-data)
               ;(prn 'old-id->tempid old-id->tempid)
@@ -254,7 +270,16 @@
               ;(prn '---)
               next-acc)
             acc)
-          :pending pending)))
+          ;; Build pending index: map from required-eid to pending datoms that need it
+          :pending-index (reduce
+                           (fn [idx {:keys [required-eids] :as pending-datom}]
+                             (reduce
+                               (fn [idx eid]
+                                 (update idx eid (fnil conj []) pending-datom))
+                               idx
+                               required-eids))
+                           {}
+                           pending-datoms))))
     init-state datom-batches))
 
 (comment (sc.api/defsc 1))
@@ -449,7 +474,8 @@
                                          :datom-batches batches
                                          :eid->schema   eid->schema}
                                   debug (assoc :debug debug)
-                                  init-state (assoc :init-state init-state)))]
+                                  init-state (assoc :init-state init-state)))
+            final-pending-count (reduce + (map count (vals (:pending-index result))))]
         (log/info "Data copy complete"
           :total-transactions (:tx-count result)
           :total-datoms (:tx-datom-count result)
@@ -457,7 +483,7 @@
           :avg-tx-ms (if (pos? (:tx-count result))
                        (int (/ (:total-tx-time-ms result) (:tx-count result)))
                        0)
-          :final-pending-count (count (:pending result)))
+          :final-pending-count final-pending-count)
         result)
       ;(catch Exception ex (sc.api/spy) (throw ex))
       (finally (reset! *running? false)))))
