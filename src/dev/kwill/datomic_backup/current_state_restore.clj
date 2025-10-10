@@ -116,6 +116,23 @@
                               (filter (fn [{:keys [waiting-for]}] (empty? waiting-for))))
                             pending)
         datoms-and-pending (concat datoms (map :datom retryable-pending))]
+
+    ;; Diagnostic: Log detailed info about pending resolution
+    (when (and (seq pending) (< (count retryable-pending) (count pending)))
+      (let [still-pending (- (count pending) (count retryable-pending))
+            sample-stuck (first (remove (fn [{:keys [waiting-for]}] (empty? waiting-for))
+                                  (map (fn [{:keys [required-eids] :as p}]
+                                         (assoc p :waiting-for (sets/difference required-eids eids-exposed)))
+                                    pending)))]
+        (log/info "Pending datom analysis"
+          :total-pending (count pending)
+          :retryable (count retryable-pending)
+          :still-waiting still-pending
+          :eids-exposed-count (count eids-exposed)
+          :newly-created-count (count newly-created-eids)
+          :sample-stuck-datom (:datom sample-stuck)
+          :sample-waiting-for (:waiting-for sample-stuck))))
+
     (reduce (fn [acc [e a v :as datom]]
               (if (= :db/txInstant (get-in eid->schema [a :db/ident]))
                 ;; not actually used, only collected for reporting purposes
@@ -170,6 +187,28 @@
                     tx-eids
                     pending]}
             (txify-datoms batch (:pending acc) eid->schema old-id->new-id newly-created-eids)]
+
+        ;; Diagnostic: Log when we're not making progress
+        (when (and debug
+                (empty? tx-data)
+                (seq batch))
+          (log/warn "Batch produced no transactions!"
+            :batch-size (count batch)
+            :pending-count (count pending)
+            :prev-pending-count (count (:pending acc))
+            :batch-first-3 (take 3 batch)))
+
+        ;; Diagnostic: Detect stuck state - same pending count for multiple batches
+        (when (and debug
+                (= (count pending) (count (:pending acc)))
+                (pos? (count pending))
+                (empty? tx-data))
+          (log/error "STUCK: Same pending count, no progress!"
+            :pending-count (count pending)
+            :tx-count (:tx-count acc)
+            :first-pending-datom (first (map :datom pending))
+            :first-pending-waiting-for (first (map :waiting-for pending))))
+
         (assoc
           (if (seq tx-data)
             (let [tx-start (System/currentTimeMillis)
@@ -217,6 +256,8 @@
             acc)
           :pending pending)))
     init-state datom-batches))
+
+(comment (sc.api/defsc 1))
 
 (defn read-datoms-in-parallel-sync
   [source-db {:keys [dest-ch parallelism]}]
@@ -395,17 +436,12 @@
                       :read-chunk     read-chunk})
                    (ch->seq)))
         eid->schema (::impl/eid->schema schema-lookup)
-        ident->schema (::impl/ident->schema schema-lookup)
-        ;; TODO: add support for Entity Specs
-        ignored-attrs #{:db.install/attribute :db/ensure}
-        ignored-attr-eids (set (map #(get-in ident->schema [% :db/id]) ignored-attrs))
         batches (let [max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
                       schema-ids (into #{} (map key) eid->schema)]
                   (->> datoms
-                    (remove (fn [[e a _ tx]]
+                    (remove (fn [[e _ _ tx]]
                               (or
                                 (contains? schema-ids e)
-                                (contains? ignored-attr-eids a)
                                 (<= tx max-bootstrap-tx))))
                     (partition-all max-batch-size)))]
     (try
@@ -609,10 +645,14 @@
         _ (log/info "Schema copy complete")
 
         ;; Step 2: Restore data for non-composite tuple attributes
+        ;; Filter out attributes we don't want to restore datoms for
+        ignored-attrs #{:db/ensure :db.install/attribute}
         non-composite-tuple-attribute-eids
         (into []
-          (map (fn [{:db/keys [ident]}]
-                 (get-in source-schema-lookup [::impl/ident->schema ident :db/id])))
+          (comp
+            (remove (fn [{:db/keys [ident]}] (contains? ignored-attrs ident)))
+            (map (fn [{:db/keys [ident]}]
+                   (get-in source-schema-lookup [::impl/ident->schema ident :db/id]))))
           non-composite-tuple-schema)
 
         _ (log/info "Starting data restore")
