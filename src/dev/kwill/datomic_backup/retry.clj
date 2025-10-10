@@ -44,7 +44,8 @@
   (or
     (contains? #{:cognitect.anomalies/busy
                  :cognitect.anomalies/unavailable
-                 :cognitect.anomalies/interrupted}
+                 :cognitect.anomalies/interrupted
+                 :cognitect.anomalies/fault}
       (:cognitect.anomalies/category x))
     (and (instance? ExceptionInfo x)
       (default-retriable? (ex-data x)))))
