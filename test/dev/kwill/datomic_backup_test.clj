@@ -289,6 +289,19 @@
                                          :read-chunk       1000}))
         (:assertions scenario)))))
 
+(deftest tuple-scenarios-restore-db
+  (doseq [scenario tuple-test-scenarios
+          :when (not (#{"Composite tuples added after data"
+                        "Composite tuples with renamed component attributes"}
+                      (:name scenario)))]
+    (with-open [ctx (testh/test-ctx {})]
+      (run-restore-test ctx
+        (:schema scenario)
+        (fn [ctx]
+          (backup/restore-db {:source    (:source-conn ctx)
+                              :dest-conn (:dest-conn ctx)}))
+        (:assertions scenario)))))
+
 (deftest get-backup-test
   (with-open [ctx (testh/test-ctx {})]
     (let [backup (backup/backup-db
