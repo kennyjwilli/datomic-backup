@@ -17,10 +17,11 @@
   - Near 100% batch efficiency in pass 1
   - Minimal pending in pass 2 (only circular refs)
   - Expected speedup: 1.5-2.5x for databases with many ref attributes
+  - Pass 1 supports parallel transactions (via `:tx-parallelism`)
 
   ## Performance Tuning
 
-  The restore process has three main performance knobs:
+  The restore process has these main performance knobs:
 
   - `:max-batch-size` (default 500) - Datoms per transaction
     Higher = fewer transactions, faster overall
@@ -30,6 +31,10 @@
 
   - `:read-chunk` (default 5000) - Datoms per read chunk
     Higher = fewer read calls
+
+  - `:tx-parallelism` (default 4) - Parallel transaction workers for Pass 1
+    Only used when `:two-pass? true`
+    Higher = more concurrent transactions (limited by Datomic transactor throughput)
 
   ## Performance Metrics
 
@@ -426,6 +431,189 @@
         (Thread/sleep every-ms))))
   ch)
 
+(defn batch-datoms!
+  "Batches datoms from input channel into max-batch-size batches.
+  Filters out schema and bootstrap datoms.
+  Closes work-ch when input channel closes."
+  [datom-ch work-ch max-batch-size eid->schema max-bootstrap-tx]
+  (try
+    (loop [batch []]
+      (if-let [datom (<anom!! datom-ch)]
+        (let [[e _ _ tx] datom]
+          ;; Skip bootstrap/schema datoms
+          (if (or (contains? eid->schema e) (<= tx max-bootstrap-tx))
+            (recur batch)
+            ;; Accumulate batch
+            (if (< (count batch) max-batch-size)
+              (recur (conj batch datom))
+              ;; Batch is full, send it and start new batch with current datom
+              (do
+                (async/>!! work-ch batch)
+                (recur [datom])))))
+        ;; Input channel closed, send final batch if non-empty
+        (when (seq batch)
+          (async/>!! work-ch batch))))
+    (finally
+      (async/close! work-ch))))
+
+(defn tx-worker!
+  "Worker that processes batches from work-ch and sends results to result-ch.
+  For Pass 1 non-ref datoms only - no pending logic needed."
+  [work-ch result-ch dest-conn eid->schema debug worker-id]
+  (loop []
+    (when-let [batch (async/<!! work-ch)]
+      (try
+        (let [tx-start (System/currentTimeMillis)
+              ;; txify-datoms with empty old-id->new-id (Pass 1 non-ref datoms)
+              {:keys [tx-data old-id->tempid]}
+              (txify-datoms batch {} eid->schema {} #{})
+
+              ;; Transact
+              {:keys [tempids tx-data]}
+              (when (seq tx-data)
+                (retry/with-retry #(d/transact dest-conn {:tx-data tx-data})))
+
+              tx-duration (- (System/currentTimeMillis) tx-start)
+
+              ;; Build old-id→new-id mapping
+              old-id->new-id
+              (into {} (keep (fn [[old-id tempid]]
+                               (when-let [eid (get tempids tempid)]
+                                 [old-id eid])))
+                old-id->tempid)]
+
+          (when debug
+            (log/debug "Worker completed batch"
+              :worker-id worker-id
+              :batch-size (count batch)
+              :tx-data-size (count tx-data)
+              :tx-duration-ms tx-duration))
+
+          ;; Send result
+          (async/>!! result-ch {:old-id->new-id old-id->new-id
+                                :tx-count       1
+                                :tx-datom-count (count tx-data)
+                                :tx-time-ms     tx-duration
+                                :batch-size     (count batch)}))
+        (catch Exception ex
+          (log/error ex "Worker failed to process batch" :worker-id worker-id)
+          (async/>!! result-ch {:error ex})))
+      (recur))))
+
+(defn collect-results!
+  "Collects results from workers and merges them into final state.
+  Logs progress every 10 transactions when debug is enabled.
+  Returns when result-ch is closed."
+  [result-ch debug]
+  (loop [acc {:old-id->new-id    {}
+              :tx-count          0
+              :tx-datom-count    0
+              :total-tx-time-ms  0
+              :input-datom-count 0}]
+    (if-let [result (async/<!! result-ch)]
+      (if (:error result)
+        ;; Error occurred, propagate it
+        (throw (:error result))
+        ;; Merge result
+        (let [next-acc (-> acc
+                         (update :old-id->new-id merge (:old-id->new-id result))
+                         (update :tx-count + (:tx-count result))
+                         (update :tx-datom-count + (:tx-datom-count result))
+                         (update :total-tx-time-ms + (:tx-time-ms result))
+                         (update :input-datom-count + (:batch-size result)))]
+          (when (and debug (zero? (mod (:tx-count next-acc) 10)))
+            (log/info "Parallel batch progress"
+              :tx-count (:tx-count next-acc)
+              :tx-datom-count (:tx-datom-count next-acc)
+              :entities-created (count (:old-id->new-id next-acc))
+              :avg-tx-ms (int (/ (:total-tx-time-ms next-acc) (:tx-count next-acc)))))
+          (recur next-acc)))
+      ;; Channel closed, all workers are done
+      acc)))
+
+(defn pass1-parallel-copy
+  "Parallel transaction pipeline for Pass 1 (non-ref datoms).
+  
+  Since Pass 1 datoms have no ref dependencies, we can transact
+  batches in parallel without coordination between transactions.
+  
+  Pipeline:
+  [Datom Reader] → [Batcher] → [Work Queue] → [N Workers] → [Results Collector]"
+  [{:keys [source-db
+           schema-lookup
+           dest-conn
+           max-batch-size
+           debug
+           read-parallelism
+           read-chunk
+           tx-parallelism
+           attribute-eids]}]
+  (log/info "Starting Pass 1 parallel datom copy"
+    :read-parallelism read-parallelism
+    :tx-parallelism tx-parallelism
+    :chunk-size read-chunk
+    :batch-size max-batch-size
+    :attribute-count (count attribute-eids))
+
+  (let [eid->schema (::impl/eid->schema schema-lookup)
+        max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
+        schema-ids (into #{} (map key) eid->schema)
+
+        ;; Channels
+        datom-ch (async/chan 20000)
+        work-ch (async/chan (* 2 tx-parallelism))
+        result-ch (async/chan 100)
+
+        ;; Start datom reader
+        _ (read-datoms-in-parallel-sync2 source-db
+            {:attribute-eids attribute-eids
+             :parallelism    read-parallelism
+             :dest-ch        datom-ch
+             :read-chunk     read-chunk})
+
+        ;; Start batcher thread
+        batcher-thread (async/thread
+                         (batch-datoms! datom-ch work-ch max-batch-size schema-ids max-bootstrap-tx))
+
+        ;; Start worker threads
+        worker-threads (vec (repeatedly tx-parallelism
+                              (fn []
+                                (let [worker-id (gensym "worker-")]
+                                  (async/thread
+                                    (tx-worker! work-ch result-ch dest-conn eid->schema debug worker-id))))))
+
+        ;; Start result collector in a thread
+        collector-thread (async/thread (collect-results! result-ch debug))]
+
+    ;; Wait for batcher to finish (closes work-ch)
+    (async/<!! batcher-thread)
+
+    ;; Wait for all workers to finish (they exit when work-ch closes)
+    (doseq [worker-thread worker-threads]
+      (async/<!! worker-thread))
+
+    ;; Close result-ch so collector finishes
+    (async/close! result-ch)
+
+    ;; Get final results from collector
+    (let [final-state (async/<!! collector-thread)]
+      (log/info "Pass 1 parallel copy complete"
+        :total-transactions (:tx-count final-state)
+        :total-datoms (:tx-datom-count final-state)
+        :entities-created (count (:old-id->new-id final-state))
+        :avg-tx-ms (if (pos? (:tx-count final-state))
+                     (int (/ (:total-tx-time-ms final-state) (:tx-count final-state)))
+                     0))
+
+      ;; Return state in same format as -full-copy
+      (assoc final-state
+        :tx-eids #{}
+        :newly-created-eids #{}
+        :pending-index {}
+        :dest-conn dest-conn
+        :eid->schema eid->schema
+        :debug debug))))
+
 (defn -full-copy
   [{:keys [source-db
            schema-lookup
@@ -705,28 +893,41 @@
   - Zero pending overhead (no ref dependencies)
   - Near 100% batch efficiency
   - Builds complete old-id->new-id mapping
+  - Can use parallel transactions when :tx-parallelism > 1
   
   Pass 2: Process all ref attributes
   - Minimal pending (only circular refs)
-  - Most refs resolve immediately"
-  [{:keys [attribute-eids schema-lookup] :as argm}]
+  - Most refs resolve immediately
+  - Always sequential (due to potential circular refs)"
+  [{:keys [attribute-eids schema-lookup tx-parallelism] :as argm}]
   (log/info "Starting current state restore (two-pass mode)")
   (let [{non-ref-attrs :non-ref
          ref-attrs     :ref} (partition-attributes-by-ref schema-lookup attribute-eids)
+
+        tx-parallelism (or tx-parallelism 1)
 
         _ (log/info "Two-pass strategy"
             :total-attributes (count attribute-eids)
             :non-ref-attributes (count non-ref-attrs)
             :ref-attributes (count ref-attrs)
-            :ref-percentage (format "%.1f%%" (* 100.0 (/ (count ref-attrs) (count attribute-eids)))))
+            :ref-percentage (format "%.1f%%" (* 100.0 (/ (count ref-attrs) (count attribute-eids))))
+            :tx-parallelism tx-parallelism)
 
         ;; PASS 1: Non-ref attributes
         pass1-start (System/currentTimeMillis)
         _ (log/info "=== PASS 1: Starting non-ref datoms restore ==="
-            :attribute-count (count non-ref-attrs))
-        pass1-result (-full-copy (assoc argm
-                                   :attribute-eids non-ref-attrs
-                                   :schema-lookup schema-lookup))
+            :attribute-count (count non-ref-attrs)
+            :mode (if (> tx-parallelism 1) "parallel" "sequential"))
+        pass1-result (if (> tx-parallelism 1)
+                       ;; Use parallel implementation
+                       (pass1-parallel-copy (assoc argm
+                                              :attribute-eids non-ref-attrs
+                                              :schema-lookup schema-lookup
+                                              :tx-parallelism tx-parallelism))
+                       ;; Use sequential implementation
+                       (-full-copy (assoc argm
+                                     :attribute-eids non-ref-attrs
+                                     :schema-lookup schema-lookup)))
         pass1-duration (- (System/currentTimeMillis) pass1-start)
         _ (log/info "=== PASS 1: Complete ==="
             :total-transactions (:tx-count pass1-result)
@@ -738,7 +939,7 @@
             :duration-sec (int (/ pass1-duration 1000))
             :final-pending-count (reduce + (map count (vals (:pending-index pass1-result)))))
 
-        ;; PASS 2: Ref attributes
+        ;; PASS 2: Ref attributes (always sequential)
         pass2-start (System/currentTimeMillis)
         _ (log/info "=== PASS 2: Starting ref datoms restore ==="
             :attribute-count (count ref-attrs)
@@ -771,9 +972,13 @@
 
   Options:
   - :two-pass? - If true, uses two-pass strategy (non-ref then ref datoms).
-                 Default: false (single-pass with pending resolution)"
-  [{:keys [source-db dest-conn two-pass?] :as argm}]
+                 Default: false (single-pass with pending resolution)
+  - :tx-parallelism - Number of parallel transaction workers for Pass 1 in two-pass mode.
+                      Only used when :two-pass? is true.
+                      Default: 4"
+  [{:keys [source-db dest-conn two-pass? tx-parallelism] :as argm}]
   (let [_ (log/info "Starting current state restore")
+        tx-parallelism (or tx-parallelism 4)
         source-schema-lookup (impl/q-schema-lookup source-db)
         {:keys [schema old->new-ident-lookup]} (get-schema-args source-db)
 
@@ -799,11 +1004,14 @@
                    (get-in source-schema-lookup [::impl/ident->schema ident :db/id]))))
           non-composite-tuple-schema)
 
-        _ (log/info "Starting data restore" :two-pass? two-pass?)
+        _ (log/info "Starting data restore"
+            :two-pass? two-pass?
+            :tx-parallelism (when two-pass? tx-parallelism))
         result (if two-pass?
                  (restore-two-pass (assoc argm
                                      :attribute-eids non-composite-tuple-attribute-eids
-                                     :schema-lookup source-schema-lookup))
+                                     :schema-lookup source-schema-lookup
+                                     :tx-parallelism tx-parallelism))
                  (-full-copy (assoc argm
                                :attribute-eids non-composite-tuple-attribute-eids
                                :schema-lookup source-schema-lookup)))
