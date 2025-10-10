@@ -3,6 +3,7 @@
     [clojure.test :refer :all]
     [datomic.client.api :as d]
     [dev.kwill.datomic-backup.current-state-restore :as csr]
+    [dev.kwill.datomic-backup.impl :as impl]
     [dev.kwill.datomic-backup.test-helpers :as testh]))
 
 (deftest copy-schema-basic-test
@@ -428,5 +429,42 @@
             "Component attributes should be copied")
           (is (nil? (:db/ident tuple-attr))
             "Tuple attribute should NOT be created when schema is pre-filtered"))))))
+
+(deftest partition-attributes-by-ref-test
+  (testing "Partitions attributes into :non-ref and :ref categories"
+    (let [string-attr-eid 100
+          long-attr-eid 101
+          ref-attr-eid 102
+          composite-no-ref-eid 103
+          composite-with-ref-eid 104
+
+          schema-lookup {::impl/eid->schema
+                         {string-attr-eid        {:db/ident     :person/name
+                                                  :db/valueType :db.type/string}
+                          long-attr-eid          {:db/ident     :person/age
+                                                  :db/valueType :db.type/long}
+                          ref-attr-eid           {:db/ident     :person/employer
+                                                  :db/valueType :db.type/ref}
+                          composite-no-ref-eid   {:db/ident      :person/full-name
+                                                  :db/valueType  :db.type/tuple
+                                                  :db/tupleAttrs [string-attr-eid long-attr-eid]}
+                          composite-with-ref-eid {:db/ident      :person/employer-and-name
+                                                  :db/valueType  :db.type/tuple
+                                                  :db/tupleAttrs [ref-attr-eid string-attr-eid]}}}
+
+          attribute-eids [string-attr-eid long-attr-eid ref-attr-eid
+                          composite-no-ref-eid composite-with-ref-eid]
+
+          result (csr/partition-attributes-by-ref schema-lookup attribute-eids)]
+
+      ;; Non-ref attributes: string, long, and composite tuple without refs
+      (is (= #{string-attr-eid long-attr-eid composite-no-ref-eid}
+            (set (:non-ref result)))
+        "Non-ref should include basic types and tuples without refs")
+
+      ;; Ref attributes: direct ref and composite tuple with ref
+      (is (= #{ref-attr-eid composite-with-ref-eid}
+            (set (:ref result)))
+        "Ref should include direct refs and tuples containing refs"))))
 
 

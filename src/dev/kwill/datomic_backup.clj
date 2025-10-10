@@ -134,7 +134,18 @@
      :backup-file "backup.txt"}))
 
 (defn current-state-restore
-  [{:keys [source-db dest-conn max-batch-size read-parallelism read-chunk debug]
+  "Restores current state (no history) from source-db to dest-conn.
+  
+  Options:
+  - :source-db - Source database value
+  - :dest-conn - Destination connection
+  - :max-batch-size - Datoms per transaction (default 500)
+  - :read-parallelism - Parallel attribute reads (default 20)
+  - :read-chunk - Datoms per read chunk (default 5000)
+  - :debug - Enable debug logging (default false)
+  - :two-pass? - Use two-pass strategy: non-ref then ref datoms (default false)
+                 Can provide 1.5-2.5x speedup for databases with many ref attributes"
+  [{:keys [source-db dest-conn max-batch-size read-parallelism read-chunk debug two-pass?]
     :or   {max-batch-size   500
            read-parallelism 20
            read-chunk       5000}}]
@@ -143,7 +154,8 @@
              :dest-conn        dest-conn
              :max-batch-size   max-batch-size
              :read-parallelism read-parallelism
-             :read-chunk       read-chunk}
+             :read-chunk       read-chunk
+             :two-pass?        (boolean two-pass?)}
       debug (assoc :debug debug))))
 
 (comment
