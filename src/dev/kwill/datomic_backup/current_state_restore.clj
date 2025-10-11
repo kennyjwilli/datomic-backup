@@ -156,13 +156,11 @@
           :sample-stuck-datom (:datom sample-stuck)
           :sample-waiting-for (:waiting-for sample-stuck))))
 
-    (reduce (fn [acc [e a v :as datom]]
+    (reduce (fn [acc [e a :as datom]]
               (if (= :db/txInstant (get-in eid->schema [a :db/ident]))
                 ;; not actually used, only collected for reporting purposes
                 (update acc :tx-eids (fnil conj #{}) e)
-                (let [{:keys [tx
-                              required-eids
-                              resolved-e-id]
+                (let [{:keys [tx required-eids resolved-e-id]
                        :as   resolved} (resolve-datom datom eid->schema old-id->new-id)
                       can-include? (sets/subset? required-eids eids-exposed)
                       waiting-for (sets/difference required-eids eids-exposed)]

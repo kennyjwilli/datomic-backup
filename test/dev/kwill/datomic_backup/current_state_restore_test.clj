@@ -657,4 +657,102 @@
           (is (= #{2000 9999 3000} (:required-eids result)) "Should track all refs")
           (is (= "resolved-e-1000" (:resolved-e-id result))))))))
 
+(deftest txify-datoms-pending-resolution-test
+  (testing "Pending datoms are retried when required entities become exposed"
+    (let [;; Schema with scalar and ref attributes
+          eid->schema {100 {:db/ident :person/name :db/valueType :db.type/string}
+                       101 {:db/ident :person/friend :db/valueType :db.type/ref}}
+
+          ;; Entity 1000 was created in a previous batch
+          old-id->new-id {1000 "tempid-1000"}
+
+          ;; Pending index: datom from entity 1000 referencing entity 2000 (not yet created)
+          ;; This simulates a ref that couldn't be processed because the target didn't exist
+          pending-index {2000 [{:tx            [:db/add "tempid-1000" :person/friend "2000"]
+                                :required-eids #{2000}
+                                :resolved-e-id "tempid-1000"
+                                :datom         (testh/make-datom 1000 101 2000 1233)
+                                :waiting-for   #{2000}}]}
+
+          ;; Current batch creates entity 2000 with a scalar attribute
+          ;; This should trigger retry of the pending ref datom
+          datoms [(testh/make-datom 2000 100 "Bob" 1234)]
+
+          ;; Call txify-datoms
+          result (csr/txify-datoms datoms pending-index eid->schema old-id->new-id #{})]
+
+      ;; Verify both the new entity and the previously-pending ref are in tx-data
+      (is (= 2 (count (:tx-data result)))
+        "Should include both the new entity datom and the retried pending datom")
+
+      (is (contains? (set (:tx-data result)) [:db/add "2000" :person/name "Bob"])
+        "Should include the new entity's scalar attribute")
+
+      (is (contains? (set (:tx-data result)) [:db/add "tempid-1000" :person/friend "2000"])
+        "Should include the retried pending ref datom")
+
+      ;; Verify no pending datoms remain (all were resolved)
+      (is (nil? (:pending-datoms result))
+        "Should have no pending datoms after resolution")
+
+      ;; Verify old-id->tempid is updated for both entities
+      (is (= "tempid-1000" (get-in result [:old-id->tempid 1000]))
+        "Should preserve mapping for previously created entity")
+
+      (is (= "2000" (get-in result [:old-id->tempid 2000]))
+        "Should create mapping for newly created entity"))))
+
+(deftest txify-datoms-complex-batch-test
+  (testing "Complex batch with scalars, refs, tuples, and special cases"
+    (let [eid->schema {100 {:db/ident :person/name :db/valueType :db.type/string}
+                       101 {:db/ident :person/age :db/valueType :db.type/long}
+                       102 {:db/ident :person/friend :db/valueType :db.type/ref}
+                       103 {:db/ident      :relationship/data
+                            :db/valueType  :db.type/tuple
+                            :db/tupleTypes [:db.type/ref :db.type/string :db.type/long]}
+                       50  {:db/ident :db/txInstant :db/valueType :db.type/instant}}
+
+          ;; Entity 3000 already exists from previous batches
+          old-id->new-id {3000 "tempid-3000"}
+
+          datoms [(testh/make-datom 1000 100 "Alice" 1001)  ;; Scalar string - should process
+                  (testh/make-datom 1000 101 25 1001)       ;; Scalar long - should process
+                  (testh/make-datom 1000 102 2000 1001)     ;; Ref to non-existent 2000 - should pend
+                  (testh/make-datom 2000 100 "Bob" 1002)    ;; Scalar string - should process
+                  (testh/make-datom 2000 102 3000 1002)     ;; Ref to existing 3000 - should process
+                  (testh/make-datom 4000 103 [3000 "knows" 42] 1003) ;; Tuple with ref to existing - should process
+                  (testh/make-datom 5000 103 [9999 "unknown" 7] 1004) ;; Tuple with ref to non-existent - should pend
+                  (testh/make-datom 999 50 #inst "2024-01-01" 1005)] ;; txInstant - special handling
+
+          result (csr/txify-datoms datoms {} eid->schema old-id->new-id #{})]
+
+      ;; Verify scalars and available refs are processed
+      ;; NOTE: Entity 2000 is created in this batch, so the ref from 1000->2000 is also processed
+      (is (= #{[:db/add "1000" :person/name "Alice"]
+               [:db/add "1000" :person/age 25]
+               [:db/add "1000" :person/friend "2000"]
+               [:db/add "2000" :person/name "Bob"]
+               [:db/add "2000" :person/friend "tempid-3000"]
+               [:db/add "4000" :relationship/data ["tempid-3000" "knows" 42]]}
+            (set (:tx-data result)))
+        "Should process 6 datoms: 3 scalars, 2 refs (one to existing, one to entity created in batch), 1 tuple with available ref")
+
+      ;; Verify pending datoms for unavailable refs
+      ;; NOTE: The ref from 1000->2000 is NOT pending because 2000 is created in this batch
+      (is (= [{:datom         (testh/make-datom 5000 103 [9999 "unknown" 7] 1004)
+               :required-eids #{9999}
+               :resolved-e-id "5000"
+               :tx            [:db/add "5000" :relationship/data ["9999" "unknown" 7]]
+               :waiting-for   #{9999}}] (:pending-datoms result))
+        "Should have 1 pending datom for tuple with ref to non-existent entity 9999")
+
+      ;; Verify txInstant is tracked separately (not in tx-data or pending)
+      (is (= #{999} (:tx-eids result))
+        "txInstant entities should be tracked in :tx-eids")
+
+      ;; Verify old-id->tempid mappings
+      (is (= {1000 "1000" 2000 "2000" 4000 "4000" 5000 "5000"}
+            (:old-id->tempid result))
+        "Should create tempid mappings for 4 entities (1000, 2000, 4000, 5000)"))))
+
 
