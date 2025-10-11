@@ -325,33 +325,33 @@
         x)))
    schema))
 
-(defn schema-result->lookup
-  [schema-result]
-  (reduce
-   (fn [lookup [{:keys [db/id db/ident] :as schema}]]
-     (let [cleaned-schema (clean-schema schema identity)]
-       (-> lookup
-           (update ::schema-raw (fnil conj [])
-                   (clean-schema schema (fn [x]
-                                          (if (map? x)
-                                            (dissoc x :db/id)
-                                            x))))
-           (assoc-in [::eid->schema id] cleaned-schema)
-           (assoc-in [::ident->schema ident] cleaned-schema))))
-   {} schema-result))
-
-(defn build-ident-alias-map
+(defn get-old->new-ident-lookup
   [db]
   (let [history-db (d/history db)
         ident-changes (d/q '[:find ?e ?old-ident ?new-ident ?tx
                              :where
                              [?e :db/ident ?old-ident ?tx false]
                              [?e :db/ident ?new-ident ?tx true]]
-                           history-db)]
+                        history-db)]
     (into {}
-          (map (fn [[_e old-ident new-ident _tx]]
-                 [old-ident new-ident]))
-          ident-changes)))
+      (map (fn [[_e old-ident new-ident _tx]]
+             [old-ident new-ident]))
+      ident-changes)))
+
+(defn schema-result->lookup
+  [schema-result]
+  (reduce
+    (fn [lookup [{:db/keys [id ident] :as schema}]]
+      (let [cleaned-schema (clean-schema schema identity)]
+        (-> lookup
+          (update ::schema-raw (fnil conj [])
+            (clean-schema schema (fn [x]
+                                   (if (map? x)
+                                     (dissoc x :db/id)
+                                     x))))
+          (assoc-in [::eid->schema id] cleaned-schema)
+          (assoc-in [::ident->schema ident] cleaned-schema))))
+    {} schema-result))
 
 (defn q-schema-lookup
   [db]
@@ -361,3 +361,8 @@
                             :args [db]
                             :limit -1})]
     (schema-result->lookup schema-result)))
+                            :args  [db]
+                            :limit -1})
+        old->new-ident-lookup (get-old->new-ident-lookup db)]
+    (assoc (schema-result->lookup schema-result)
+      ::old->new-ident-lookup old->new-ident-lookup)))

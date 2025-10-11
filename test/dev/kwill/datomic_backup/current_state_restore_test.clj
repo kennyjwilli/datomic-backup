@@ -23,16 +23,16 @@
                            :db/cardinality :db.cardinality/many}]
             _ (d/transact (:source-conn ctx) {:tx-data basic-schema})
             source-db (d/db (:source-conn ctx))
-            source-schema-args (csr/get-schema-args source-db)]
+            schema-lookup (impl/q-schema-lookup source-db)]
 
-        (csr/copy-schema! (assoc source-schema-args
-                            :dest-conn (:dest-conn ctx)
-                            :schema (:schema source-schema-args)))
+        (csr/copy-schema! {:dest-conn     (:dest-conn ctx)
+                           :schema-lookup schema-lookup
+                           :attrs         (map :db/ident (::impl/schema-raw schema-lookup))})
 
         (let [dest-db (d/db (:dest-conn ctx))
-              dest-schema-args (csr/get-schema-args dest-db)]
-          (is (= (set (:schema source-schema-args))
-                (set (:schema dest-schema-args)))))))))
+              dest-schema-lookup (impl/q-schema-lookup dest-db)]
+          (is (= (set (::impl/schema-raw schema-lookup))
+                (set (::impl/schema-raw dest-schema-lookup)))))))))
 
 (deftest copy-schema-with-tupleAttrs-test
   (testing "Copy schema with tupleAttrs dependencies"
@@ -50,18 +50,18 @@
                                :db/unique      :db.unique/identity}]
             _ (d/transact (:source-conn ctx) {:tx-data schema-with-deps})
             source-db (d/db (:source-conn ctx))
-            source-schema-args (csr/get-schema-args source-db)]
+            schema-lookup (impl/q-schema-lookup source-db)]
 
         ;; Copy schema to dest - should handle dependencies correctly
-        (csr/copy-schema! (assoc source-schema-args
-                            :dest-conn (:dest-conn ctx)
-                            :schema (:schema source-schema-args)))
+        (csr/copy-schema! {:dest-conn     (:dest-conn ctx)
+                           :schema-lookup schema-lookup
+                           :attrs         (map :db/ident (::impl/schema-raw schema-lookup))})
 
         ;; Verify schema matches
         (let [dest-db (d/db (:dest-conn ctx))
-              dest-schema-args (csr/get-schema-args dest-db)]
-          (is (= (set (:schema source-schema-args))
-                (set (:schema dest-schema-args)))))
+              dest-schema-lookup (impl/q-schema-lookup dest-db)]
+          (is (= (set (::impl/schema-raw schema-lookup))
+                (set (::impl/schema-raw dest-schema-lookup)))))
 
         ;; Verify we can transact data using the tuple
         (d/transact (:dest-conn ctx)
@@ -103,20 +103,20 @@
                             :semester/season    :spring}]})
 
             source-db (d/db (:source-conn ctx))
-            source-schema-args (csr/get-schema-args source-db)]
+            schema-lookup (impl/q-schema-lookup source-db)]
 
         ;; Copy schema to dest - should handle renamed attributes correctly
-        (csr/copy-schema! (assoc source-schema-args
-                            :dest-conn (:dest-conn ctx)
-                            :schema (:schema source-schema-args)))
+        (csr/copy-schema! {:dest-conn     (:dest-conn ctx)
+                           :schema-lookup schema-lookup
+                           :attrs         (map :db/ident (::impl/schema-raw schema-lookup))})
 
         ;; Verify schema in destination
         (let [dest-db (d/db (:dest-conn ctx))
-              dest-schema-args (csr/get-schema-args dest-db)
+              dest-schema-lookup (impl/q-schema-lookup dest-db)
 
               ;; Get the tuple attribute from dest schema
               dest-tuple-attr (first (filter #(= :semester/year+season (:db/ident %))
-                                       (:schema dest-schema-args)))
+                                       (::impl/schema-raw dest-schema-lookup)))
 
               ;; Test: Can we look up both old and new idents in source?
               source-old-ident (d/pull source-db '[:db/ident] :semester/year)
@@ -190,18 +190,18 @@
                             :db/ident :person/full-name}]})
 
             source-db (d/db (:source-conn ctx))
-            source-schema-args (csr/get-schema-args source-db)]
+            schema-lookup (impl/q-schema-lookup source-db)]
 
         ;; Copy the renamed schema
-        (csr/copy-schema! (assoc source-schema-args
-                            :dest-conn (:dest-conn ctx)
-                            :schema (:schema source-schema-args)))
+        (csr/copy-schema! {:dest-conn     (:dest-conn ctx)
+                           :schema-lookup schema-lookup
+                           :attrs         (map :db/ident (::impl/schema-raw schema-lookup))})
 
         ;; Verify schema matches
         (let [dest-db (d/db (:dest-conn ctx))
-              dest-schema-args (csr/get-schema-args dest-db)]
-          (is (= (set (:schema source-schema-args))
-                (set (:schema dest-schema-args)))))
+              dest-schema-lookup (impl/q-schema-lookup dest-db)]
+          (is (= (set (::impl/schema-raw schema-lookup))
+                (set (::impl/schema-raw dest-schema-lookup)))))
 
         ;; Verify we can use the new ident
         (d/transact (:dest-conn ctx)
@@ -227,9 +227,10 @@
 (deftest copy-schema-edge-cases-test
   (testing "Empty schema"
     (with-open [ctx (testh/test-ctx {})]
-      (let [result (csr/copy-schema! {:dest-conn             (:dest-conn ctx)
-                                      :schema                []
-                                      :old->new-ident-lookup {}})]
+      (let [result (csr/copy-schema! {:dest-conn     (:dest-conn ctx)
+                                      :schema-lookup {::impl/schema-raw            []
+                                                      ::impl/old->new-ident-lookup {}}
+                                      :attrs         []})]
         (is (= {:source-schema []} result)))))
 
   (testing "Schema with unique constraint"
@@ -240,17 +241,17 @@
                             :db/unique      :db.unique/identity}]
             _ (d/transact (:source-conn ctx) {:tx-data unique-schema})
             source-db (d/db (:source-conn ctx))
-            source-schema-args (csr/get-schema-args source-db)]
+            schema-lookup (impl/q-schema-lookup source-db)]
 
-        (csr/copy-schema! (assoc source-schema-args
-                            :dest-conn (:dest-conn ctx)
-                            :schema (:schema source-schema-args)))
+        (csr/copy-schema! {:dest-conn     (:dest-conn ctx)
+                           :schema-lookup schema-lookup
+                           :attrs         (map :db/ident (::impl/schema-raw schema-lookup))})
 
         ;; Verify schema matches
         (let [dest-db (d/db (:dest-conn ctx))
-              dest-schema-args (csr/get-schema-args dest-db)]
-          (is (= (set (:schema source-schema-args))
-                (set (:schema dest-schema-args)))))
+              dest-schema-lookup (impl/q-schema-lookup dest-db)]
+          (is (= (set (::impl/schema-raw schema-lookup))
+                (set (::impl/schema-raw dest-schema-lookup)))))
 
         ;; Verify unique constraint works with :db.unique/identity (enables upsert)
         (d/transact (:dest-conn ctx) {:tx-data [{:user/email "test@example.com"}]})
@@ -276,17 +277,17 @@
                          :db/cardinality :db.cardinality/one}]
             _ (d/transact (:source-conn ctx) {:tx-data ref-schema})
             source-db (d/db (:source-conn ctx))
-            source-schema-args (csr/get-schema-args source-db)]
+            schema-lookup (impl/q-schema-lookup source-db)]
 
-        (csr/copy-schema! (assoc source-schema-args
-                            :dest-conn (:dest-conn ctx)
-                            :schema (:schema source-schema-args)))
+        (csr/copy-schema! {:dest-conn     (:dest-conn ctx)
+                           :schema-lookup schema-lookup
+                           :attrs         (map :db/ident (::impl/schema-raw schema-lookup))})
 
         ;; Verify schema matches
         (let [dest-db (d/db (:dest-conn ctx))
-              dest-schema-args (csr/get-schema-args dest-db)]
-          (is (= (set (:schema source-schema-args))
-                (set (:schema dest-schema-args)))))
+              dest-schema-lookup (impl/q-schema-lookup dest-db)]
+          (is (= (set (::impl/schema-raw schema-lookup))
+                (set (::impl/schema-raw dest-schema-lookup)))))
 
         ;; Verify ref works
         (d/transact (:dest-conn ctx)
@@ -327,18 +328,18 @@
                              :db/cardinality :db.cardinality/one}]
             _ (d/transact (:source-conn ctx) {:tx-data complex-schema})
             source-db (d/db (:source-conn ctx))
-            source-schema-args (csr/get-schema-args source-db)]
+            schema-lookup (impl/q-schema-lookup source-db)]
 
         ;; Should successfully handle multi-wave dependencies
-        (csr/copy-schema! (assoc source-schema-args
-                            :dest-conn (:dest-conn ctx)
-                            :schema (:schema source-schema-args)))
+        (csr/copy-schema! {:dest-conn     (:dest-conn ctx)
+                           :schema-lookup schema-lookup
+                           :attrs         (map :db/ident (::impl/schema-raw schema-lookup))})
 
         ;; Verify schema matches
         (let [dest-db (d/db (:dest-conn ctx))
-              dest-schema-args (csr/get-schema-args dest-db)]
-          (is (= (set (:schema source-schema-args))
-                (set (:schema dest-schema-args)))))
+              dest-schema-lookup (impl/q-schema-lookup dest-db)]
+          (is (= (set (::impl/schema-raw schema-lookup))
+                (set (::impl/schema-raw dest-schema-lookup)))))
 
         ;; Verify tuples work
         (d/transact (:dest-conn ctx)
@@ -385,10 +386,7 @@
           (is (= ["Alice" "Smith"] (:person/full-name alice-before)))
           (is (= ["Bob" "Jones"] (:person/full-name bob-before))))
 
-        (csr/establish-composite! (:dest-conn ctx)
-          {:attr       :person/first-name
-           :batch-size 10
-           :pacing-sec 0})
+        (csr/establish-composite-tuple! (:dest-conn ctx) {:attr :person/first-name :batch-size 10})
 
         (let [db-after (d/db (:dest-conn ctx))
               alice-after (d/pull db-after '[:person/first-name :person/last-name :person/full-name] alice-eid)
@@ -412,11 +410,13 @@
                                 :db/unique      :db.unique/identity}]
             _ (d/transact (:source-conn ctx) {:tx-data schema-with-tuple})
             source-db (d/db (:source-conn ctx))
-            source-schema-args (csr/get-schema-args source-db)]
+            schema-lookup (impl/q-schema-lookup source-db)
+            ;; Filter to only non-tuple attributes
+            non-tuple-attrs (map :db/ident (remove :db/tupleAttrs (::impl/schema-raw schema-lookup)))]
 
-        (csr/copy-schema! (assoc source-schema-args
-                            :dest-conn (:dest-conn ctx)
-                            :schema (remove :db/tupleAttrs (:schema source-schema-args))))
+        (csr/copy-schema! {:dest-conn     (:dest-conn ctx)
+                           :schema-lookup schema-lookup
+                           :attrs         non-tuple-attrs})
 
         (let [dest-db (d/db (:dest-conn ctx))
               year-attr (d/pull dest-db '[:db/ident :db/valueType] :semester/year)
@@ -432,38 +432,39 @@
 
 (deftest partition-attributes-by-ref-test
   (testing "Partitions attributes into :non-ref and :ref categories"
-    (let [string-attr-eid 100
-          long-attr-eid 101
-          ref-attr-eid 102
-          composite-no-ref-eid 103
-          composite-with-ref-eid 104
+    (let [schema [{:db/ident     :person/name
+                   :db/valueType :db.type/string}
+                  {:db/ident     :person/age
+                   :db/valueType :db.type/long}
+                  {:db/ident     :person/employer
+                   :db/valueType :db.type/ref}
+                  {:db/ident      :person/full-name
+                   :db/valueType  :db.type/tuple
+                   :db/tupleAttrs [:person/name :person/age]}
+                  {:db/ident      :person/employer-and-name
+                   :db/valueType  :db.type/tuple
+                   :db/tupleAttrs [:person/employer :person/name]}]
+          ident->schema (into {} (map (juxt :db/ident identity)) schema)
 
-          schema-lookup {::impl/eid->schema
-                         {string-attr-eid        {:db/ident     :person/name
-                                                  :db/valueType :db.type/string}
-                          long-attr-eid          {:db/ident     :person/age
-                                                  :db/valueType :db.type/long}
-                          ref-attr-eid           {:db/ident     :person/employer
-                                                  :db/valueType :db.type/ref}
-                          composite-no-ref-eid   {:db/ident      :person/full-name
-                                                  :db/valueType  :db.type/tuple
-                                                  :db/tupleAttrs [string-attr-eid long-attr-eid]}
-                          composite-with-ref-eid {:db/ident      :person/employer-and-name
-                                                  :db/valueType  :db.type/tuple
-                                                  :db/tupleAttrs [ref-attr-eid string-attr-eid]}}}
-
-          attribute-eids [string-attr-eid long-attr-eid ref-attr-eid
-                          composite-no-ref-eid composite-with-ref-eid]
-
-          result (csr/partition-attributes-by-ref schema-lookup attribute-eids)]
+          result (csr/partition-attributes-by-ref ident->schema)]
 
       ;; Non-ref attributes: string, long, and composite tuple without refs
-      (is (= #{string-attr-eid long-attr-eid composite-no-ref-eid}
+      (is (= #{{:db/ident     :person/name
+                :db/valueType :db.type/string}
+               {:db/ident     :person/age
+                :db/valueType :db.type/long}
+               {:db/ident      :person/full-name
+                :db/valueType  :db.type/tuple
+                :db/tupleAttrs [:person/name :person/age]}}
             (set (:non-ref result)))
         "Non-ref should include basic types and tuples without refs")
 
       ;; Ref attributes: direct ref and composite tuple with ref
-      (is (= #{ref-attr-eid composite-with-ref-eid}
+      (is (= #{{:db/ident     :person/employer
+                :db/valueType :db.type/ref}
+               {:db/ident      :person/employer-and-name
+                :db/valueType  :db.type/tuple
+                :db/tupleAttrs [:person/employer :person/name]}}
             (set (:ref result)))
         "Ref should include direct refs and tuples containing refs"))))
 

@@ -496,6 +496,7 @@
                                 :tx-time-ms     tx-duration
                                 :batch-size     (count batch)}))
         (catch Exception ex
+          (sc.api/spy)
           (log/error ex "Worker failed to process batch" :worker-id worker-id)
           (async/>!! result-ch {:error ex})))
       (recur))))
@@ -576,11 +577,10 @@
                          (batch-datoms! datom-ch work-ch max-batch-size schema-ids max-bootstrap-tx))
 
         ;; Start worker threads
-        worker-threads (vec (repeatedly tx-parallelism
-                              (fn []
-                                (let [worker-id (gensym "worker-")]
-                                  (async/thread
-                                    (tx-worker! work-ch result-ch dest-conn eid->schema debug worker-id))))))
+        worker-threads (into []
+                         (map (fn [idx]
+                                (async/thread (tx-worker! work-ch result-ch dest-conn eid->schema debug (str "worker-" idx)))))
+                         (range tx-parallelism))
 
         ;; Start result collector in a thread
         collector-thread (async/thread (collect-results! result-ch debug))]
@@ -766,8 +766,15 @@
         (process-batch! batch)))))
 
 (defn copy-schema!
-  [{:keys [dest-conn schema old->new-ident-lookup]}]
-  (let [new->old-ident-lookup (sets/map-invert old->new-ident-lookup)
+  [{:keys [dest-conn schema-lookup attrs]}]
+  (let [new->old-ident-lookup (sets/map-invert (::impl/old->new-ident-lookup schema-lookup))
+        schema (into []
+                 (comp
+                   (filter #(contains? (set attrs) (:db/ident %)))
+                   (remove (fn [{:db/keys [ident]}] (contains? #{:db/ensure :db.install/attribute} ident)))
+                   ;; TODO: add support for attr preds (must be done after full restore is done)
+                   (map #(dissoc % :db.attr/preds)))
+                 (::impl/schema-raw schema-lookup))
         waves (partition-schema-by-deps schema)]
     (log/info "Installing schema"
       :total-attributes (count schema)
@@ -782,38 +789,18 @@
           :wave (inc wave-idx)
           :attributes (count wave))
         (if (seq renamed-map)
-          (do
-            (let [wave-with-old-idents (mapv (fn [attr]
-                                               (if-let [old-ident (get renamed-map (:db/ident attr))]
-                                                 (assoc attr :db/ident old-ident)
-                                                 attr))
-                                         wave)]
-              (retry/with-retry
-                #(d/transact dest-conn {:tx-data wave-with-old-idents})))
-            (let [rename-txs (mapv (fn [[new-ident old-ident]]
-                                     {:db/id    old-ident
-                                      :db/ident new-ident})
-                               renamed-in-wave)]
-              (retry/with-retry
-                #(d/transact dest-conn {:tx-data rename-txs}))))
+          (let [wave-with-old-idents (mapv (fn [attr]
+                                             (if-let [old-ident (get renamed-map (:db/ident attr))]
+                                               (assoc attr :db/ident old-ident)
+                                               attr))
+                                       wave)
+                _ (retry/with-retry #(d/transact dest-conn {:tx-data wave-with-old-idents}))
+                rename-txs (mapv (fn [[new-ident old-ident]] {:db/id old-ident :db/ident new-ident}) renamed-in-wave)
+                _ (retry/with-retry #(d/transact dest-conn {:tx-data rename-txs}))])
           (retry/with-retry
             #(d/transact dest-conn {:tx-data wave})))))
 
     {:source-schema schema}))
-
-(defn get-schema-args
-  [db]
-  (let [source-schema-lookup (impl/q-schema-lookup db)
-        old->new-ident-lookup (impl/build-ident-alias-map db)
-        ignored-attrs #{:db/ensure :db.install/attribute}
-        ;; TODO: add support for attr preds (must be done after full restore is done)
-        schema (into []
-                 (comp
-                   (remove (fn [{:db/keys [ident]}] (contains? ignored-attrs ident)))
-                   (map #(dissoc % :db.attr/preds)))
-                 (::impl/schema-raw source-schema-lookup))]
-    {:schema                schema
-     :old->new-ident-lookup old->new-ident-lookup}))
 
 (defn add-tuple-attrs!
   "Adds tuple attributes to schema and establishes their composite values."
@@ -930,9 +917,8 @@
             :total-transactions (:tx-count pass2-result)
             :total-datoms (:tx-datom-count pass2-result)
             :entities-total (count (:old-id->new-id pass2-result))
-            :avg-tx-ms (if (> (:tx-count pass2-result) (:tx-count pass1-result))
-                         (int (/ (- (:total-tx-time-ms pass2-result) (:total-tx-time-ms pass1-result))
-                                (- (:tx-count pass2-result) (:tx-count pass1-result))))
+            :avg-tx-ms (if (pos? (:tx-count pass1-result))
+                         (int (/ (:total-tx-time-ms pass1-result) (:tx-count pass1-result)))
                          0)
             :duration-sec (int (/ pass2-duration 1000))
             :final-pending-count (reduce + (map count (vals (:pending-index pass2-result)))))
@@ -960,39 +946,35 @@
         ;; Heterogeneous (:db/tupleTypes) and homogeneous (:db/tupleType) tuples
         ;; are installed with the initial schema.
         schema-lookup (impl/q-schema-lookup source-db)
-        {:keys [schema old->new-ident-lookup]} (get-schema-args source-db)
-        non-composite-tuple-schema (remove :db/tupleAttrs schema)
+        non-composite-attrs (into [] (comp (remove :db/tupleAttrs) (map :db/ident)) (::impl/schema-raw schema-lookup))
         _ (log/info "Copying schema (non-composite tuple attributes)"
-            :total-attributes (count schema)
-            :non-composite-tuple-attributes (count non-composite-tuple-schema))
-        _ (copy-schema! {:dest-conn             dest-conn
-                         :schema                non-composite-tuple-schema
-                         :old->new-ident-lookup old->new-ident-lookup})
+            :total-attributes (count (::impl/schema-raw schema-lookup))
+            :non-composite-tuple-attributes (count non-composite-attrs))
+        _ (copy-schema! {:dest-conn     dest-conn
+                         :attrs         non-composite-attrs
+                         :schema-lookup schema-lookup})
         _ (log/info "Starting data restore"
             :two-pass? two-pass?
             :tx-parallelism (when two-pass? tx-parallelism))
-        non-composite-idents (map :db/ident non-composite-tuple-schema)
         result (if two-pass?
                  (restore-two-pass (assoc argm
-                                     :attrs non-composite-idents
+                                     :attrs non-composite-attrs
                                      :schema-lookup schema-lookup
                                      :tx-parallelism tx-parallelism))
                  (-full-copy (assoc argm
-                               :attrs non-composite-idents
+                               :attrs non-composite-attrs
                                :schema-lookup schema-lookup)))
         _ (log/info "Data restore complete" :result result)
 
-        composite-tuple-schema (filter :db/tupleAttrs schema)
-        _ (when (seq composite-tuple-schema)
+        composite-tuple-schema (filter :db/tupleAttrs (::impl/schema-raw schema-lookup))
+        composite-tuple-attrs (map :db/ident composite-tuple-schema)
+        _ (when (seq composite-tuple-attrs)
             (log/info "Processing composite tuple attributes"
-              :tuple-attr-count (count composite-tuple-schema)))
-        _ (log/info "Adding tupleAttrs to schema after data restore"
-            :tuple-attr-count (count composite-tuple-schema))
-        _ (copy-schema! {:dest-conn             dest-conn
-                         :schema                composite-tuple-schema
-                         :old->new-ident-lookup old->new-ident-lookup})
-        _ (log/info "Establishing composite tuple values")
-        _ (add-tuple-attrs! {:dest-conn dest-conn :tuple-schema composite-tuple-schema})]
+              :tuple-attr-count (count composite-tuple-attrs))
+            (copy-schema! {:dest-conn     dest-conn
+                           :attrs         composite-tuple-attrs
+                           :schema-lookup schema-lookup})
+            (add-tuple-attrs! {:dest-conn dest-conn :tuple-schema composite-tuple-schema}))]
     true))
 
 (comment (sc.api/defsc 1)
