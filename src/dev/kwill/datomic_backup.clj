@@ -1,6 +1,7 @@
 (ns dev.kwill.datomic-backup
   (:require
     [clojure.java.io :as io]
+    [clojure.tools.logging :as log]
     [datomic.client.api :as d]
     [dev.kwill.datomic-backup.current-state-restore :as cs-restore]
     [dev.kwill.datomic-backup.impl :as impl])
@@ -12,28 +13,47 @@
   (let [max-tx-id (when progress (impl/max-tx-id-from-source source))
         source (if (impl/conn? source) source (io/reader (io/file source)))
         init-state (assoc init-state :tx-count 0)
+        _ (log/info "restore-db: calling transactions-from-source")
         transactions (impl/transactions-from-source source
                        (cond-> {}
                          (:last-imported-tx init-state)
                          (assoc :start (inc (:last-imported-tx init-state)))
                          stop (assoc :stop stop)))
+        _ (log/info "restore-db: got transactions sequence, getting init-db")
         init-db ((if with? d/with-db d/db) dest-conn)]
+    (log/info "Starting restore"
+      :source (if (impl/conn? source) "conn" "file")
+      :resuming-from-tx (:last-imported-tx init-state)
+      :max-tx max-tx-id)
+    (log/info "restore-db: starting reduce over transactions")
     (try
-      (reduce
-        (fn [state datoms]
-          (cond-> (impl/next-datoms-state state
-                    datoms
-                    (if with?
-                      #(d/with (:db-before state) %)
-                      #(transact dest-conn %)))
-            progress
-            (impl/next-progress-report progress (:tx (first datoms)) max-tx-id)))
-        (assoc init-state
-          :db-before init-db
-          :source-eid->dest-eid (or
-                                  (:source-eid->dest-eid init-state)
-                                  (impl/initial-eid-mapping init-db)))
-        transactions)
+      (let [result (reduce
+                     (fn [state datoms]
+                       (log/info "reduce fn: received datoms batch" :count (count datoms) :first-tx (:tx (first datoms)))
+                       (let [new-state (cond-> (impl/next-datoms-state state
+                                                 datoms
+                                                 (if with?
+                                                   #(d/with (:db-before state) %)
+                                                   #(transact dest-conn %)))
+                                         progress
+                                         (impl/next-progress-report progress (:tx (first datoms)) max-tx-id))
+                             tx-count (:tx-count new-state)]
+                         (log/info "reduce fn: next-datoms-state returned" :new-tx-count tx-count)
+                         (when (zero? (mod tx-count 100))
+                           (log/info "Processed transactions"
+                             :tx-count tx-count
+                             :last-imported-tx (:last-imported-tx new-state)
+                             :max-tx max-tx-id
+                             :percent (when max-tx-id (format "%.1f%%" (* 100.0 (/ (:last-imported-tx new-state) max-tx-id))))))
+                         new-state))
+                     (assoc init-state
+                       :db-before init-db
+                       :source-eid->dest-eid (or
+                                               (:source-eid->dest-eid init-state)
+                                               (impl/initial-eid-mapping init-db)))
+                     transactions)]
+        (log/info "Restore complete" :tx-count (:tx-count result))
+        result)
       (finally
         (when (instance? Closeable source) (.close source))))))
 
