@@ -365,19 +365,52 @@
              [old-ident new-ident]))
       ident-changes)))
 
+(def datomic-internal-attrs
+  "Idents managed by Datomic that should not be added to user-land schema."
+  #{:db/system-tx
+    :db/ident
+    :db.install/partition
+    :db.install/valueType
+    :db.install/attribute
+    :db/excise
+    :db.excise/attrs
+    :db.excise/beforeT
+    :db.excise/before
+    :db.alter/attribute
+    :fressian/tag
+    :db/valueType
+    :db/cardinality
+    :db/unique
+    :db/isComponent
+    :db/noHistory
+    :db/txInstant
+    :db/fulltext
+    :db/txUUID
+    :db/doc
+    :db/tupleType
+    :db/tupleTypes
+    :db/tupleAttrs
+    :db.entity/attrs
+    :db.entity/preds
+    :db.attr/preds
+    ;; db/ensure is technically asserted on user-land entities, but we don't support it yet here
+    :db/ensure})
+
 (defn schema-result->lookup
   [schema-result]
   (reduce
     (fn [lookup [{:db/keys [id ident] :as schema}]]
-      (let [cleaned-schema (clean-schema schema identity)]
-        (-> lookup
-          (update ::schema-raw (fnil conj [])
-            (clean-schema schema (fn [x]
-                                   (if (map? x)
-                                     (dissoc x :db/id)
-                                     x))))
-          (assoc-in [::eid->schema id] cleaned-schema)
-          (assoc-in [::ident->schema ident] cleaned-schema))))
+      (if (contains? datomic-internal-attrs ident)
+        lookup
+        (let [cleaned-schema (clean-schema schema identity)]
+          (-> lookup
+            (update ::schema-raw (fnil conj [])
+              (clean-schema schema (fn [x]
+                                     (if (map? x)
+                                       (dissoc x :db/id)
+                                       x))))
+            (assoc-in [::eid->schema id] cleaned-schema)
+            (assoc-in [::ident->schema ident] cleaned-schema)))))
     {} schema-result))
 
 (defn q-schema-lookup
