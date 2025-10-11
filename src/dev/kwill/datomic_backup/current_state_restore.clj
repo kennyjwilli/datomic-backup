@@ -58,15 +58,15 @@
   - `:final-pending-count` - Should be 0
   - `:duration-sec` - Total time to read all datoms"
   (:require
-    [clojure.core.async :as async]
-    [clojure.set :as sets]
-    [clojure.tools.logging :as log]
-    [clojure.walk :as walk]
-    [datomic.client.api :as d]
-    [datomic.client.api.async :as d.a]
-    [dev.kwill.datomic-backup.impl :as impl]
-    [dev.kwill.datomic-backup.retry :as retry]
-    [sc.api])
+   [clojure.core.async :as async]
+   [clojure.set :as sets]
+   [clojure.tools.logging :as log]
+   [clojure.walk :as walk]
+   [datomic.client.api :as d]
+   [datomic.client.api.async :as d.a]
+   [dev.kwill.datomic-backup.impl :as impl]
+   [dev.kwill.datomic-backup.retry :as retry]
+   [sc.api])
   (:import (clojure.lang ExceptionInfo)
            (java.util.concurrent Executors)))
 
@@ -86,18 +86,18 @@
                           [(resolve-v (:db/valueType attr-schema) v) #{v}]
                           (= value-type :db.type/tuple)
                           (let [types (or
-                                        (seq (map get-value-type (:db/tupleAttrs attr-schema)))
-                                        (:db/tupleTypes attr-schema)
-                                        (repeat (:db/tupleType attr-schema)))
+                                       (seq (map get-value-type (:db/tupleAttrs attr-schema)))
+                                       (:db/tupleTypes attr-schema)
+                                       (repeat (:db/tupleType attr-schema)))
                                 eids (into #{}
-                                       (comp
-                                         (filter (fn [[t]] (= t :db.type/ref)))
-                                         (map (fn [[_ v]] v)))
-                                       (map vector types v))]
+                                           (comp
+                                            (filter (fn [[t]] (= t :db.type/ref)))
+                                            (map (fn [[_ v]] v)))
+                                           (map vector types v))]
                             [(mapv (fn [type v] (resolve-v type v)) types v)
                              eids]))
         tx [:db/add e-id (get attr-schema :db/ident) (or v-id v)]]
-    {:tx            tx
+    {:tx tx
      ;; set of eids required for this datom to get transacted
      :required-eids (or req-eids #{})
      :resolved-e-id e-id}))
@@ -115,29 +115,29 @@
   (let [;; an attempt to add a tuple or ref value pointing to an eid NOT in this
         ;; set should be attempted later
         eids-exposed (into (set (keys old-id->new-id))
-                       (comp
-                         (remove (fn [[_ a]]
-                                   (contains? #{:db.type/tuple
-                                                :db.type/ref}
-                                     (get-in eid->schema [a :db/valueType]))))
-                         (map :e))
-                       datoms)
+                           (comp
+                            (remove (fn [[_ a]]
+                                      (contains? #{:db.type/tuple
+                                                   :db.type/ref}
+                                                 (get-in eid->schema [a :db/valueType]))))
+                            (map :e))
+                           datoms)
 
         ;; Only check pending datoms whose required EIDs were just exposed
         ;; This avoids the O(n*m) overhead of scanning all pending every batch
         newly-exposed-eids (sets/difference eids-exposed (set (keys old-id->new-id)))
         potentially-ready-pending (into []
-                                    (mapcat (fn [eid] (get pending-index eid)))
-                                    newly-exposed-eids)
+                                        (mapcat (fn [eid] (get pending-index eid)))
+                                        newly-exposed-eids)
 
         ;; Update pending datoms to track what they're still waiting for
         ;; and retry any whose dependencies are now satisfied
         retryable-pending (into []
-                            (comp
-                              (map (fn [{:keys [required-eids] :as p}]
-                                     (assoc p :waiting-for (sets/difference required-eids eids-exposed))))
-                              (filter (fn [{:keys [waiting-for]}] (empty? waiting-for))))
-                            potentially-ready-pending)
+                                (comp
+                                 (map (fn [{:keys [required-eids] :as p}]
+                                        (assoc p :waiting-for (sets/difference required-eids eids-exposed))))
+                                 (filter (fn [{:keys [waiting-for]}] (empty? waiting-for))))
+                                potentially-ready-pending)
         datoms-and-pending (concat datoms (map :datom retryable-pending))]
 
     ;; Diagnostic: Log detailed info about pending resolution
@@ -145,18 +145,18 @@
       (let [total-pending (reduce + (map count (vals pending-index)))
             still-pending (- (count potentially-ready-pending) (count retryable-pending))
             sample-stuck (first (remove (fn [{:keys [waiting-for]}] (empty? waiting-for))
-                                  (map (fn [{:keys [required-eids] :as p}]
-                                         (assoc p :waiting-for (sets/difference required-eids eids-exposed)))
-                                    potentially-ready-pending)))]
+                                        (map (fn [{:keys [required-eids] :as p}]
+                                               (assoc p :waiting-for (sets/difference required-eids eids-exposed)))
+                                             potentially-ready-pending)))]
         (log/info "Pending datom analysis"
-          :total-pending total-pending
-          :checked-pending (count potentially-ready-pending)
-          :retryable (count retryable-pending)
-          :still-waiting still-pending
-          :eids-exposed-count (count eids-exposed)
-          :newly-created-count (count newly-created-eids)
-          :sample-stuck-datom (:datom sample-stuck)
-          :sample-waiting-for (:waiting-for sample-stuck))))
+                  :total-pending total-pending
+                  :checked-pending (count potentially-ready-pending)
+                  :retryable (count retryable-pending)
+                  :still-waiting still-pending
+                  :eids-exposed-count (count eids-exposed)
+                  :newly-created-count (count newly-created-eids)
+                  :sample-stuck-datom (:datom sample-stuck)
+                  :sample-waiting-for (:waiting-for sample-stuck))))
 
     (reduce (fn [acc [e a v :as datom]]
               (if (= :db/txInstant (get-in eid->schema [a :db/ident]))
@@ -165,7 +165,7 @@
                 (let [{:keys [tx
                               required-eids
                               resolved-e-id]
-                       :as   resolved} (resolve-datom datom eid->schema old-id->new-id)
+                       :as resolved} (resolve-datom datom eid->schema old-id->new-id)
                       can-include? (sets/subset? required-eids eids-exposed)
                       waiting-for (sets/difference required-eids eids-exposed)]
                   (cond-> acc
@@ -173,12 +173,12 @@
                     (update :tx-data (fnil conj []) tx)
                     (not can-include?)
                     (update :pending-datoms (fnil conj []) (assoc resolved
-                                                             :datom datom
-                                                             :waiting-for waiting-for
-                                                             :required-eids required-eids))
+                                                                  :datom datom
+                                                                  :waiting-for waiting-for
+                                                                  :required-eids required-eids))
                     (string? resolved-e-id)
                     (assoc-in [:old-id->tempid e] resolved-e-id)))))
-      {} datoms-and-pending)))
+            {} datoms-and-pending)))
 
 (defn process-single-batch
   "Process a single batch of datoms, updating the accumulator state."
@@ -192,77 +192,77 @@
 
     ;; Diagnostic: Log when we're not making progress
     (when (and debug
-            (empty? tx-data)
-            (seq batch))
+               (empty? tx-data)
+               (seq batch))
       (let [total-pending (reduce + (map count (vals pending-index)))]
         (log/warn "Batch produced no transactions!"
-          :batch-size (count batch)
-          :total-pending total-pending
-          :prev-pending-count (reduce + (map count (vals (:pending-index acc))))
-          :batch-first-3 (take 3 batch))))
+                  :batch-size (count batch)
+                  :total-pending total-pending
+                  :prev-pending-count (reduce + (map count (vals (:pending-index acc))))
+                  :batch-first-3 (take 3 batch))))
 
     ;; Diagnostic: Detect stuck state - same pending count for multiple batches
     (when (and debug
-            (let [cur-pending (reduce + (map count (vals pending-index)))
-                  prev-pending (reduce + (map count (vals (:pending-index acc))))]
-              (and (= cur-pending prev-pending)
-                (pos? cur-pending)
-                (empty? tx-data))))
+               (let [cur-pending (reduce + (map count (vals pending-index)))
+                     prev-pending (reduce + (map count (vals (:pending-index acc))))]
+                 (and (= cur-pending prev-pending)
+                      (pos? cur-pending)
+                      (empty? tx-data))))
       (let [total-pending (reduce + (map count (vals pending-index)))]
         (log/error "STUCK: Same pending count, no progress!"
-          :pending-count total-pending
-          :tx-count (:tx-count acc)
-          :first-pending-datom (first (mapcat identity (vals pending-index))))))
+                   :pending-count total-pending
+                   :tx-count (:tx-count acc)
+                   :first-pending-datom (first (mapcat identity (vals pending-index))))))
 
     (assoc
-      (if (seq tx-data)
-        (let [tx-start (System/currentTimeMillis)
-              {:keys [tempids
-                      tx-data]} (try
-                                  (retry/with-retry #(d/transact dest-conn {:tx-data tx-data})
-                                    {:backoff (retry/capped-exponential-backoff-with-jitter
-                                                {:max-retries 20})})
-                                  (catch Exception ex
-                                    (sc.api/spy)
-                                    (throw ex)))
-              tx-duration (- (System/currentTimeMillis) tx-start)
-              next-old-id->new-id (into old-id->new-id
-                                    (map (fn [[old-id tempid]]
-                                           (when-let [eid (get tempids tempid)]
-                                             [old-id eid])))
-                                    old-id->tempid)
+     (if (seq tx-data)
+       (let [tx-start (System/currentTimeMillis)
+             {:keys [tempids
+                     tx-data]} (try
+                                 (retry/with-retry #(d/transact dest-conn {:tx-data tx-data})
+                                   {:backoff (retry/capped-exponential-backoff-with-jitter
+                                              {:max-retries 20})})
+                                 (catch Exception ex
+                                   (sc.api/spy)
+                                   (throw ex)))
+             tx-duration (- (System/currentTimeMillis) tx-start)
+             next-old-id->new-id (into old-id->new-id
+                                       (map (fn [[old-id tempid]]
+                                              (when-let [eid (get tempids tempid)]
+                                                [old-id eid])))
+                                       old-id->tempid)
               ;; Track which old entity IDs were just created in this transaction
-              next-newly-created-eids (into #{} (map first) old-id->tempid)
-              next-acc (-> acc
-                         (assoc
+             next-newly-created-eids (into #{} (map first) old-id->tempid)
+             next-acc (-> acc
+                          (assoc
                            :old-id->new-id next-old-id->new-id
                            :newly-created-eids next-newly-created-eids)
-                         (update :input-datom-count (fnil + 0) (count batch))
-                         (update :tx-count (fnil inc 0))
-                         (update :tx-datom-count (fnil + 0) (count tx-data))
-                         (update :tx-eids sets/union tx-eids)
-                         (update :total-tx-time-ms (fnil + 0) tx-duration))]
-          (when (and debug (zero? (mod (:tx-count next-acc) 10)))
-            (let [total-pending (reduce + (map count (vals pending-index)))]
-              (log/info "Batch progress"
-                :tx-count (:tx-count next-acc)
-                :tx-datom-count (:tx-datom-count next-acc)
-                :pending-count total-pending
-                :last-tx-ms tx-duration
-                :avg-tx-ms (int (/ (:total-tx-time-ms next-acc) (:tx-count next-acc)))
-                :batch-efficiency (format "%.1f%%" (* 100.0 (/ (count tx-data) (+ (count batch) (count pending-datoms))))))))
-          next-acc)
-        acc)
+                          (update :input-datom-count (fnil + 0) (count batch))
+                          (update :tx-count (fnil inc 0))
+                          (update :tx-datom-count (fnil + 0) (count tx-data))
+                          (update :tx-eids sets/union tx-eids)
+                          (update :total-tx-time-ms (fnil + 0) tx-duration))]
+         (when (and debug (zero? (mod (:tx-count next-acc) 10)))
+           (let [total-pending (reduce + (map count (vals pending-index)))]
+             (log/info "Batch progress"
+                       :tx-count (:tx-count next-acc)
+                       :tx-datom-count (:tx-datom-count next-acc)
+                       :pending-count total-pending
+                       :last-tx-ms tx-duration
+                       :avg-tx-ms (int (/ (:total-tx-time-ms next-acc) (:tx-count next-acc)))
+                       :batch-efficiency (format "%.1f%%" (* 100.0 (/ (count tx-data) (+ (count batch) (count pending-datoms))))))))
+         next-acc)
+       acc)
       ;; Build pending index: map from required-eid to pending datoms that need it
-      :pending-index (reduce
-                       (fn [idx {:keys [required-eids] :as pending-datom}]
-                         (reduce
-                           (fn [idx eid]
-                             (update idx eid (fnil conj []) pending-datom))
-                           idx
-                           required-eids))
-                       {}
-                       pending-datoms))))
+     :pending-index (reduce
+                     (fn [idx {:keys [required-eids] :as pending-datom}]
+                       (reduce
+                        (fn [idx eid]
+                          (update idx eid (fnil conj []) pending-datom))
+                        idx
+                        required-eids))
+                     {}
+                     pending-datoms))))
 
 (comment (sc.api/defsc 1))
 
@@ -288,8 +288,8 @@
           (do
             (read-datoms-to-chan! db (assoc argm ::_start-exclusive @*start) dest-ch)
             (log/warn "Retryable anomaly while reading datoms. Retrying with :start set..."
-              :anomaly (ex-data ex)
-              :start-exclusive @*start))
+                      :anomaly (ex-data ex)
+                      :start-exclusive @*start))
           (throw ex))))))
 
 (defn read-datoms-in-parallel
@@ -299,16 +299,16 @@
         start-time (System/currentTimeMillis)]
     (doseq [a attrs]
       (.submit exec ^Runnable
-        (fn []
-          (log/debug "Start reading datoms..." :attrid a)
-          (try
-            (read-datoms-to-chan! source-db
-              {:attrid a
-               :chunk  read-chunk
-               :limit  -1}
-              dest-ch)
-            (catch Exception ex (async/>!! dest-ch ex)))
-          (async/>!! done-ch a))))
+               (fn []
+                 (log/debug "Start reading datoms..." :attrid a)
+                 (try
+                   (read-datoms-to-chan! source-db
+                                         {:attrid a
+                                          :chunk read-chunk
+                                          :limit -1}
+                                         dest-ch)
+                   (catch Exception ex (async/>!! dest-ch ex)))
+                 (async/>!! done-ch a))))
     (async/go-loop [n 0]
       (let [attr (async/<! done-ch)]
         (log/debug "Done reading attr." :attrid attr))
@@ -316,9 +316,9 @@
         (recur (inc n))
         (let [duration (- (System/currentTimeMillis) start-time)]
           (log/info "All attributes read complete"
-            :total-attributes (count attrs)
-            :duration-ms duration
-            :duration-sec (int (/ duration 1000)))
+                    :total-attributes (count attrs)
+                    :duration-ms duration
+                    :duration-sec (int (/ duration 1000)))
           (async/close! dest-ch)
           (async/thread (.shutdown exec)))))
     dest-ch))
@@ -340,16 +340,16 @@
 
 (defn monitored-chan!
   [ch {:keys [runningf channel-name every-ms]
-       :or   {every-ms 10000}}]
+       :or {every-ms 10000}}]
   (async/thread
     (while (runningf)
       (let [buf (.buf ch)
             cur (.count buf)
             total (.n buf)]
         (log/info (str channel-name " channel status")
-          :current-size cur
-          :total-size total
-          :utilization-pct (format "%.1f%%" (* 100.0 (/ cur total))))
+                  :current-size cur
+                  :total-size total
+                  :utilization-pct (format "%.1f%%" (* 100.0 (/ cur total))))
         (Thread/sleep every-ms))))
   ch)
 
@@ -365,13 +365,14 @@
           ;; Skip bootstrap/schema datoms
           (if (or (contains? eid->schema e) (<= tx max-bootstrap-tx))
             (recur batch)
-            ;; Accumulate batch
-            (if (< (count batch) max-batch-size)
-              (recur (conj batch datom))
+            ;; Check if adding datom would exceed max-batch-size
+            (if (>= (count batch) max-batch-size)
               ;; Batch is full, send it and start new batch with current datom
               (do
                 (async/>!! work-ch batch)
-                (recur [datom])))))
+                (recur [datom]))
+              ;; Batch has room, add datom
+              (recur (conj batch datom)))))
         ;; Input channel closed, send final batch if non-empty
         (when (seq batch)
           (async/>!! work-ch batch))))
@@ -402,21 +403,21 @@
               (into {} (keep (fn [[old-id tempid]]
                                (when-let [eid (get tempids tempid)]
                                  [old-id eid])))
-                old-id->tempid)]
+                    old-id->tempid)]
 
           (when debug
             (log/debug "Worker completed batch"
-              :worker-id worker-id
-              :batch-size (count batch)
-              :tx-data-size (count tx-data)
-              :tx-duration-ms tx-duration))
+                       :worker-id worker-id
+                       :batch-size (count batch)
+                       :tx-data-size (count tx-data)
+                       :tx-duration-ms tx-duration))
 
           ;; Send result
           (async/>!! result-ch {:old-id->new-id old-id->new-id
-                                :tx-count       1
+                                :tx-count 1
                                 :tx-datom-count (count tx-data)
-                                :tx-time-ms     tx-duration
-                                :batch-size     (count batch)}))
+                                :tx-time-ms tx-duration
+                                :batch-size (count batch)}))
         (catch Exception ex
           (sc.api/spy)
           (log/error ex "Worker failed to process batch" :worker-id worker-id)
@@ -428,10 +429,10 @@
   Logs progress every 10 transactions when debug is enabled.
   Returns when result-ch is closed."
   [result-ch debug]
-  (loop [acc {:old-id->new-id    {}
-              :tx-count          0
-              :tx-datom-count    0
-              :total-tx-time-ms  0
+  (loop [acc {:old-id->new-id {}
+              :tx-count 0
+              :tx-datom-count 0
+              :total-tx-time-ms 0
               :input-datom-count 0}]
     (if-let [result (async/<!! result-ch)]
       (if (:error result)
@@ -439,17 +440,17 @@
         (throw (:error result))
         ;; Merge result
         (let [next-acc (-> acc
-                         (update :old-id->new-id merge (:old-id->new-id result))
-                         (update :tx-count + (:tx-count result))
-                         (update :tx-datom-count + (:tx-datom-count result))
-                         (update :total-tx-time-ms + (:tx-time-ms result))
-                         (update :input-datom-count + (:batch-size result)))]
+                           (update :old-id->new-id merge (:old-id->new-id result))
+                           (update :tx-count + (:tx-count result))
+                           (update :tx-datom-count + (:tx-datom-count result))
+                           (update :total-tx-time-ms + (:tx-time-ms result))
+                           (update :input-datom-count + (:batch-size result)))]
           (when (and debug (zero? (mod (:tx-count next-acc) 10)))
             (log/info "Parallel batch progress"
-              :tx-count (:tx-count next-acc)
-              :tx-datom-count (:tx-datom-count next-acc)
-              :entities-created (count (:old-id->new-id next-acc))
-              :avg-tx-ms (int (/ (:total-tx-time-ms next-acc) (:tx-count next-acc)))))
+                      :tx-count (:tx-count next-acc)
+                      :tx-datom-count (:tx-datom-count next-acc)
+                      :entities-created (count (:old-id->new-id next-acc))
+                      :avg-tx-ms (int (/ (:total-tx-time-ms next-acc) (:tx-count next-acc)))))
           (recur next-acc)))
       ;; Channel closed, all workers are done
       acc)))
@@ -472,11 +473,11 @@
            tx-parallelism
            attrs]}]
   (log/info "Starting Pass 1 parallel datom copy"
-    :read-parallelism read-parallelism
-    :tx-parallelism tx-parallelism
-    :chunk-size read-chunk
-    :batch-size max-batch-size
-    :attribute-count (count attrs))
+            :read-parallelism read-parallelism
+            :tx-parallelism tx-parallelism
+            :chunk-size read-chunk
+            :batch-size max-batch-size
+            :attribute-count (count attrs))
 
   (let [eid->schema (::impl/eid->schema schema-lookup)
         max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
@@ -489,10 +490,10 @@
 
         ;; Start datom reader
         _ (read-datoms-in-parallel source-db
-            {:attrs       attrs
-             :parallelism read-parallelism
-             :dest-ch     datom-ch
-             :read-chunk  read-chunk})
+                                   {:attrs attrs
+                                    :parallelism read-parallelism
+                                    :dest-ch datom-ch
+                                    :read-chunk read-chunk})
 
         ;; Start batcher thread
         batcher-thread (async/thread
@@ -500,9 +501,9 @@
 
         ;; Start worker threads
         worker-threads (into []
-                         (map (fn [idx]
-                                (async/thread (tx-worker! work-ch result-ch dest-conn eid->schema debug (str "worker-" idx)))))
-                         (range tx-parallelism))
+                             (map (fn [idx]
+                                    (async/thread (tx-worker! work-ch result-ch dest-conn eid->schema debug (str "worker-" idx)))))
+                             (range tx-parallelism))
 
         ;; Start result collector in a thread
         collector-thread (async/thread (collect-results! result-ch debug))]
@@ -520,21 +521,21 @@
     ;; Get final results from collector
     (let [final-state (async/<!! collector-thread)]
       (log/info "Pass 1 parallel copy complete"
-        :total-transactions (:tx-count final-state)
-        :total-datoms (:tx-datom-count final-state)
-        :entities-created (count (:old-id->new-id final-state))
-        :avg-tx-ms (if (pos? (:tx-count final-state))
-                     (int (/ (:total-tx-time-ms final-state) (:tx-count final-state)))
-                     0))
+                :total-transactions (:tx-count final-state)
+                :total-datoms (:tx-datom-count final-state)
+                :entities-created (count (:old-id->new-id final-state))
+                :avg-tx-ms (if (pos? (:tx-count final-state))
+                             (int (/ (:total-tx-time-ms final-state) (:tx-count final-state)))
+                             0))
 
       ;; Return state in same format as -full-copy
       (assoc final-state
-        :tx-eids #{}
-        :newly-created-eids #{}
-        :pending-index {}
-        :dest-conn dest-conn
-        :eid->schema eid->schema
-        :debug debug))))
+             :tx-eids #{}
+             :newly-created-eids #{}
+             :pending-index {}
+             :dest-conn dest-conn
+             :eid->schema eid->schema
+             :debug debug))))
 
 (defn -full-copy
   [{:keys [source-db
@@ -547,34 +548,34 @@
            init-state
            attrs]}]
   (log/info "Starting datom read"
-    :parallelism read-parallelism
-    :chunk-size read-chunk
-    :attribute-count (count attrs))
+            :parallelism read-parallelism
+            :chunk-size read-chunk
+            :attribute-count (count attrs))
   (let [*running? (atom true)
         ch (cond-> (async/chan 20000)
              debug
-             (monitored-chan! {:runningf     #(deref *running?)
+             (monitored-chan! {:runningf #(deref *running?)
                                :channel-name "datoms"}))
         _ (read-datoms-in-parallel source-db
-            {:attrs       attrs
-             :parallelism read-parallelism
-             :dest-ch     ch
-             :read-chunk  read-chunk})
+                                   {:attrs attrs
+                                    :parallelism read-parallelism
+                                    :dest-ch ch
+                                    :read-chunk read-chunk})
         eid->schema (::impl/eid->schema schema-lookup)
         max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
         schema-ids (into #{} (map key) eid->schema)
-        init-state (merge {:input-datom-count  0
-                           :old-id->new-id     {}
-                           :tx-count           0
-                           :tx-datom-count     0
-                           :tx-eids            #{}
-                           :total-tx-time-ms   0
+        init-state (merge {:input-datom-count 0
+                           :old-id->new-id {}
+                           :tx-count 0
+                           :tx-datom-count 0
+                           :tx-eids #{}
+                           :total-tx-time-ms 0
                            :newly-created-eids #{}
-                           :pending-index      {}
-                           :dest-conn          dest-conn
-                           :eid->schema        eid->schema
-                           :debug              debug}
-                     init-state)]
+                           :pending-index {}
+                           :dest-conn dest-conn
+                           :eid->schema eid->schema
+                           :debug debug}
+                          init-state)]
     (try
       (loop [acc init-state
              batch []]
@@ -595,13 +596,13 @@
                             acc)
                 final-pending-count (reduce + (map count (vals (:pending-index final-acc))))]
             (log/info "Data copy complete"
-              :total-transactions (:tx-count final-acc)
-              :total-datoms (:tx-datom-count final-acc)
-              :entities-created (count (:old-id->new-id final-acc))
-              :avg-tx-ms (if (pos? (:tx-count final-acc))
-                           (int (/ (:total-tx-time-ms final-acc) (:tx-count final-acc)))
-                           0)
-              :final-pending-count final-pending-count)
+                      :total-transactions (:tx-count final-acc)
+                      :total-datoms (:tx-datom-count final-acc)
+                      :entities-created (count (:old-id->new-id final-acc))
+                      :avg-tx-ms (if (pos? (:tx-count final-acc))
+                                   (int (/ (:total-tx-time-ms final-acc) (:tx-count final-acc)))
+                                   0)
+                      :final-pending-count final-pending-count)
             final-acc)))
       (finally (reset! *running? false)))))
 
@@ -615,21 +616,21 @@
         schema-idents (into #{} (map :db/ident) source-schema)
         get-custom-attrs (fn [schema-map]
                            (into #{}
-                             (comp
-                               (mapcat (fn [k]
-                                         (let [v (get schema-map k)]
-                                           (cond
-                                             (#{:db.entity/attrs} k)
-                                             (if (sequential? v) v [])
+                                 (comp
+                                  (mapcat (fn [k]
+                                            (let [v (get schema-map k)]
+                                              (cond
+                                                (#{:db.entity/attrs} k)
+                                                (if (sequential? v) v [])
 
-                                             (and (contains? schema-idents k)
-                                               (not (contains? datomic-built-ins k)))
-                                             [k]
+                                                (and (contains? schema-idents k)
+                                                     (not (contains? datomic-built-ins k)))
+                                                [k]
 
-                                             :else
-                                             []))))
-                               (remove datomic-built-ins))
-                             (keys schema-map)))
+                                                :else
+                                                []))))
+                                  (remove datomic-built-ins))
+                                 (keys schema-map)))
         schema-vec (vec source-schema)]
     (loop [remaining schema-vec
            available #{}
@@ -640,19 +641,19 @@
                                    (let [custom-attrs (get-custom-attrs attr)
                                          required-attrs (sets/intersection custom-attrs schema-idents)]
                                      (sets/subset? required-attrs available)))
-                          remaining)
+                                 remaining)
               next-available (into available (map :db/ident next-wave))
               next-remaining (filterv (fn [attr]
                                         (let [custom-attrs (get-custom-attrs attr)
                                               required-attrs (sets/intersection custom-attrs schema-idents)]
                                           (not (sets/subset? required-attrs available))))
-                               remaining)]
+                                      remaining)]
           (if (empty? next-wave)
             (throw (ex-info "Circular dependency in schema attributes"
-                     {:remaining-attrs (mapv :db/ident remaining)}))
+                            {:remaining-attrs (mapv :db/ident remaining)}))
             (recur next-remaining
-              next-available
-              (conj waves next-wave))))))))
+                   next-available
+                   (conj waves next-wave))))))))
 
 (defn establish-composite-tuple!
   "Reasserts all values of attr, in batches of batch-size.
@@ -666,9 +667,9 @@
                                  result (retry/with-retry #(d/transact conn {:tx-data tx-data}))
                                  added (count (:tempids result))]
                              (log/info "establish-composite batch complete"
-                               :batch-size (count batch)
-                               :first-e (:e (first batch))
-                               :added added))))]
+                                       :batch-size (count batch)
+                                       :first-e (:e (first batch))
+                                       :added added))))]
     ;; Read datoms with retry support in a separate thread
     (async/thread
       (try
@@ -691,31 +692,31 @@
   [{:keys [dest-conn schema-lookup attrs]}]
   (let [new->old-ident-lookup (sets/map-invert (::impl/old->new-ident-lookup schema-lookup))
         schema (into []
-                 (comp
-                   (filter #(contains? (set attrs) (:db/ident %)))
-                   (remove (fn [{:db/keys [ident]}] (contains? #{:db/ensure :db.install/attribute} ident)))
+                     (comp
+                      (filter #(contains? (set attrs) (:db/ident %)))
+                      (remove (fn [{:db/keys [ident]}] (contains? #{:db/ensure :db.install/attribute} ident)))
                    ;; TODO: add support for attr preds (must be done after full restore is done)
-                   (map #(dissoc % :db.attr/preds)))
-                 (::impl/schema-raw schema-lookup))
+                      (map #(dissoc % :db.attr/preds)))
+                     (::impl/schema-raw schema-lookup))
         waves (partition-schema-by-deps schema)]
     (log/info "Installing schema"
-      :total-attributes (count schema)
-      :waves (count waves))
+              :total-attributes (count schema)
+              :waves (count waves))
     (doseq [[wave-idx wave] (map-indexed vector waves)]
       (let [renamed-in-wave (keep (fn [attr]
                                     (when-let [old-ident (new->old-ident-lookup (:db/ident attr))]
                                       [(:db/ident attr) old-ident]))
-                              wave)
+                                  wave)
             renamed-map (into {} renamed-in-wave)]
         (log/info "Installing schema wave"
-          :wave (inc wave-idx)
-          :attributes (count wave))
+                  :wave (inc wave-idx)
+                  :attributes (count wave))
         (if (seq renamed-map)
           (let [wave-with-old-idents (mapv (fn [attr]
                                              (if-let [old-ident (get renamed-map (:db/ident attr))]
                                                (assoc attr :db/ident old-ident)
                                                attr))
-                                       wave)
+                                           wave)
                 _ (retry/with-retry #(d/transact dest-conn {:tx-data wave-with-old-idents}))
                 rename-txs (mapv (fn [[new-ident old-ident]] {:db/id old-ident :db/ident new-ident}) renamed-in-wave)
                 _ (retry/with-retry #(d/transact dest-conn {:tx-data rename-txs}))])
@@ -732,9 +733,9 @@
     (log/info "Establishing tuple values" :tuple-schema tuple-schema)
     (let [results (establish-composite-tuple! dest-conn {:attr (first tupleAttrs) :batch-size 500})]
       (log/info "Composite tuple establishment complete"
-        :tuple-schema tuple-schema
-        :success (:success results)
-        :skipped (:skipped results)))))
+                :tuple-schema tuple-schema
+                :success (:success results)
+                :skipped (:skipped results)))))
 
 (defn partition-attributes-by-ref
   "Partitions attribute eids into :non-ref and :ref based on their value types.
@@ -748,28 +749,28 @@
   - Tuples containing at least one ref type (composite, heterogeneous, or homogeneous)"
   [ident->schema]
   (group-by
-    (fn [attr-schema]
-      (let [value-type (:db/valueType attr-schema)]
-        (cond
+   (fn [attr-schema]
+     (let [value-type (:db/valueType attr-schema)]
+       (cond
           ;; Direct ref attribute
-          (= value-type :db.type/ref)
-          :ref
+         (= value-type :db.type/ref)
+         :ref
 
           ;; Tuple - check if it contains any ref types
-          (= value-type :db.type/tuple)
-          (let [types (or
+         (= value-type :db.type/tuple)
+         (let [types (or
                         ;; Composite tuple - get valueType of each tupleAttr
-                        (->> attr-schema :db/tupleAttrs (map #(get-in ident->schema [% :db/valueType])))
+                      (->> attr-schema :db/tupleAttrs (map #(get-in ident->schema [% :db/valueType])))
                         ;; Heterogeneous tuple - explicit types
-                        (:db/tupleTypes attr-schema)
+                      (:db/tupleTypes attr-schema)
                         ;; Homogeneous tuple
-                        [(:db/tupleType attr-schema)])]
-            (if (some #{:db.type/ref} types) :ref :non-ref))
+                      [(:db/tupleType attr-schema)])]
+           (if (some #{:db.type/ref} types) :ref :non-ref))
 
           ;; All other types (string, long, instant, etc.)
-          :else
-          :non-ref)))
-    (vals ident->schema)))
+         :else
+         :non-ref)))
+   (vals ident->schema)))
 
 (defn restore-two-pass
   "Two-pass restore: non-ref datoms first, then ref datoms.
@@ -789,67 +790,66 @@
   - Always sequential (due to potential circular refs)"
   [{:keys [attrs schema-lookup tx-parallelism] :as argm}]
   (log/info "Starting current state restore (two-pass mode)")
-  (let [tx-parallelism (or tx-parallelism 1)
-        {non-ref-attrs :non-ref
-         ref-attrs     :ref} (partition-attributes-by-ref
-                               (into {}
-                                 (comp
-                                   (filter #(contains? (set attrs) (:db/ident %)))
-                                   (map (juxt :db/ident identity)))
-                                 (::impl/schema-raw schema-lookup)))
+  (let [{non-ref-attrs :non-ref
+         ref-attrs :ref} (partition-attributes-by-ref
+                          (into {}
+                                (comp
+                                 (filter #(contains? (set attrs) (:db/ident %)))
+                                 (map (juxt :db/ident identity)))
+                                (::impl/schema-raw schema-lookup)))
 
         _ (log/info "Two-pass strategy"
-            :total-attributes (count attrs)
-            :non-ref-attributes (count non-ref-attrs)
-            :ref-attributes (count ref-attrs)
-            :ref-percentage (format "%.1f%%" (* 100.0 (/ (count ref-attrs) (count attrs))))
-            :tx-parallelism tx-parallelism)
+                    :total-attributes (count attrs)
+                    :non-ref-attributes (count non-ref-attrs)
+                    :ref-attributes (count ref-attrs)
+                    :ref-percentage (format "%.1f%%" (* 100.0 (/ (count ref-attrs) (count attrs))))
+                    :tx-parallelism tx-parallelism)
 
         ;; PASS 1: Non-ref attributes
         pass1-start (System/currentTimeMillis)
         _ (log/info "=== PASS 1: Starting non-ref datoms restore ===" :attribute-count (count non-ref-attrs))
         pass1-result (pass1-parallel-copy
-                       (assoc argm
-                         :attrs (map :db/ident non-ref-attrs)
-                         :schema-lookup schema-lookup
-                         :tx-parallelism tx-parallelism))
+                      (assoc argm
+                             :attrs (map :db/ident non-ref-attrs)
+                             :schema-lookup schema-lookup
+                             :tx-parallelism tx-parallelism))
         pass1-duration (- (System/currentTimeMillis) pass1-start)
         _ (log/info "=== PASS 1: Complete ==="
-            :total-transactions (:tx-count pass1-result)
-            :total-datoms (:tx-datom-count pass1-result)
-            :entities-created (count (:old-id->new-id pass1-result))
-            :avg-tx-ms (if (pos? (:tx-count pass1-result))
-                         (int (/ (:total-tx-time-ms pass1-result) (:tx-count pass1-result)))
-                         0)
-            :duration-sec (int (/ pass1-duration 1000))
-            :final-pending-count (reduce + (map count (vals (:pending-index pass1-result)))))
+                    :total-transactions (:tx-count pass1-result)
+                    :total-datoms (:tx-datom-count pass1-result)
+                    :entities-created (count (:old-id->new-id pass1-result))
+                    :avg-tx-ms (if (pos? (:tx-count pass1-result))
+                                 (int (/ (:total-tx-time-ms pass1-result) (:tx-count pass1-result)))
+                                 0)
+                    :duration-sec (int (/ pass1-duration 1000))
+                    :final-pending-count (reduce + (map count (vals (:pending-index pass1-result)))))
 
         ;; PASS 2: Ref attributes (always sequential)
         pass2-start (System/currentTimeMillis)
         _ (log/info "=== PASS 2: Starting ref datoms restore ==="
-            :attribute-count (count ref-attrs)
-            :entities-available (count (:old-id->new-id pass1-result)))
+                    :attribute-count (count ref-attrs)
+                    :entities-available (count (:old-id->new-id pass1-result)))
         pass2-result (when (seq ref-attrs)
                        (-full-copy (assoc argm
-                                     :attrs (map :db/ident ref-attrs)
-                                     :schema-lookup schema-lookup
-                                     :init-state pass1-result)))
+                                          :attrs (map :db/ident ref-attrs)
+                                          :schema-lookup schema-lookup
+                                          :init-state pass1-result)))
         pass2-duration (- (System/currentTimeMillis) pass2-start)
         _ (log/info "=== PASS 2: Complete ==="
-            :total-transactions (:tx-count pass2-result)
-            :total-datoms (:tx-datom-count pass2-result)
-            :entities-total (count (:old-id->new-id pass2-result))
-            :avg-tx-ms (if (pos? (:tx-count pass1-result))
-                         (int (/ (:total-tx-time-ms pass1-result) (:tx-count pass1-result)))
-                         0)
-            :duration-sec (int (/ pass2-duration 1000))
-            :final-pending-count (reduce + (map count (vals (:pending-index pass2-result)))))
+                    :total-transactions (:tx-count pass2-result)
+                    :total-datoms (:tx-datom-count pass2-result)
+                    :entities-total (count (:old-id->new-id pass2-result))
+                    :avg-tx-ms (if (pos? (:tx-count pass1-result))
+                                 (int (/ (:total-tx-time-ms pass1-result) (:tx-count pass1-result)))
+                                 0)
+                    :duration-sec (int (/ pass2-duration 1000))
+                    :final-pending-count (reduce + (map count (vals (:pending-index pass2-result)))))
         total-duration (+ pass1-duration pass2-duration)]
     {:total-duration-sec (int (/ total-duration 1000))
      :pass1-duration-sec (int (/ pass1-duration 1000))
      :pass2-duration-sec (int (/ pass2-duration 1000))
      :total-transactions (:tx-count pass2-result)
-     :total-datoms       (:tx-datom-count pass2-result)}))
+     :total-datoms (:tx-datom-count pass2-result)}))
 
 (defn restore
   "Restores a database by copying schema and current datom state.
@@ -865,44 +865,44 @@
         schema-lookup (impl/q-schema-lookup source-db)
         non-composite-attrs (into [] (comp (remove :db/tupleAttrs) (map :db/ident)) (::impl/schema-raw schema-lookup))
         _ (log/info "Copying schema (non-composite tuple attributes)"
-            :total-attributes (count (::impl/schema-raw schema-lookup))
-            :non-composite-tuple-attributes (count non-composite-attrs))
-        _ (copy-schema! {:dest-conn     dest-conn
-                         :attrs         non-composite-attrs
+                    :total-attributes (count (::impl/schema-raw schema-lookup))
+                    :non-composite-tuple-attributes (count non-composite-attrs))
+        _ (copy-schema! {:dest-conn dest-conn
+                         :attrs non-composite-attrs
                          :schema-lookup schema-lookup})
         _ (log/info "Starting data restore" :tx-parallelism tx-parallelism)
         result (restore-two-pass (assoc argm
-                                   :attrs non-composite-attrs
-                                   :schema-lookup schema-lookup
-                                   :tx-parallelism tx-parallelism))
+                                        :attrs non-composite-attrs
+                                        :schema-lookup schema-lookup
+                                        :tx-parallelism tx-parallelism))
         _ (log/info "Data restore complete" :result result)
 
         composite-tuple-schema (filter :db/tupleAttrs (::impl/schema-raw schema-lookup))
         composite-tuple-attrs (map :db/ident composite-tuple-schema)
         _ (when (seq composite-tuple-attrs)
             (log/info "Processing composite tuple attributes"
-              :tuple-attr-count (count composite-tuple-attrs))
-            (copy-schema! {:dest-conn     dest-conn
-                           :attrs         composite-tuple-attrs
+                      :tuple-attr-count (count composite-tuple-attrs))
+            (copy-schema! {:dest-conn dest-conn
+                           :attrs composite-tuple-attrs
                            :schema-lookup schema-lookup})
             (add-tuple-attrs! {:dest-conn dest-conn :tuple-schema composite-tuple-schema}))]
     true))
 
 (comment (sc.api/defsc 1)
-  (first passes)
-  (one-restore-pass one-pass-argm (first passes)))
+         (first passes)
+         (one-restore-pass one-pass-argm (first passes)))
 
 (comment
   (def testc (d/client {:server-type :datomic-local
                         :storage-dir :mem
-                        :system      "test"}))
+                        :system "test"}))
   (d/create-database testc {:db-name "a"})
   (def aconn (d/connect testc {:db-name "a"}))
   (d/transact aconn {:tx-data [{:db/ident :foo}]})
   (def tx-report *1)
   (apply max-key :e (:tx-data tx-report))
 
-  (seq (d/datoms (d/db aconn) {:index      :eavt
+  (seq (d/datoms (d/db aconn) {:index :eavt
                                :components [45]})))
 
 (comment
@@ -910,7 +910,7 @@
   (sc.api/defsc 806)
   (:tx-count acc)
   (def samplesc (d/client {:server-type :datomic-local
-                           :system      "datomic-samples"}))
+                           :system "datomic-samples"}))
   (d/list-databases samplesc {})
   (def source-db (d/db (d/connect samplesc {:db-name "mbrainz-subset"})))
 
@@ -921,21 +921,21 @@
 
   (def destc (d/client {:server-type :datomic-local
                         :storage-dir :mem
-                        :system      "dest"}))
+                        :system "dest"}))
   (d/create-database destc {:db-name "test"})
   (d/delete-database destc {:db-name "test"})
   (def dest-conn (d/connect destc {:db-name "test"}))
 
   (restore
-    {:source-db      source-db
-     :dest-conn      dest-conn
-     :max-batch-size 100})
+   {:source-db source-db
+    :dest-conn dest-conn
+    :max-batch-size 100})
 
   (get sm :language/name)
   (def stx (into []
-             (comp
-               (map (fn [[_ schema]] (walk/postwalk (fn [x] (if (map? x) (dissoc x :db/id) x)) schema)))
-               (distinct))
-             sm))
+                 (comp
+                  (map (fn [[_ schema]] (walk/postwalk (fn [x] (if (map? x) (dissoc x :db/id) x)) schema)))
+                  (distinct))
+                 sm))
   (filter (fn [x]
             (= :language/name (:db/ident x))) stx))
