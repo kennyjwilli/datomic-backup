@@ -61,9 +61,7 @@
     [clojure.core.async :as async]
     [clojure.set :as sets]
     [clojure.tools.logging :as log]
-    [clojure.walk :as walk]
     [datomic.client.api :as d]
-    [datomic.client.api.async :as d.a]
     [dev.kwill.datomic-backup.impl :as impl]
     [dev.kwill.datomic-backup.retry :as retry]
     [sc.api])
@@ -768,18 +766,14 @@
                    (map #(dissoc % :db.attr/preds)))
                  (::impl/schema-raw schema-lookup))
         waves (partition-schema-by-deps schema)]
-    (log/info "Installing schema"
-      :total-attributes (count schema)
-      :waves (count waves))
+    (log/info "Installing schema" :total-attributes (count schema) :waves (count waves))
     (doseq [[wave-idx wave] (map-indexed vector waves)]
       (let [renamed-in-wave (keep (fn [attr]
                                     (when-let [old-ident (new->old-ident-lookup (:db/ident attr))]
                                       [(:db/ident attr) old-ident]))
                               wave)
             renamed-map (into {} renamed-in-wave)]
-        (log/info "Installing schema wave"
-          :wave (inc wave-idx)
-          :attributes (count wave))
+        (log/info "Installing schema wave" :wave (inc wave-idx) :attributes (count wave))
         (if (seq renamed-map)
           (let [wave-with-old-idents (mapv (fn [attr]
                                              (if-let [old-ident (get renamed-map (:db/ident attr))]
@@ -789,9 +783,7 @@
                 _ (retry/with-retry #(d/transact dest-conn {:tx-data wave-with-old-idents}))
                 rename-txs (mapv (fn [[new-ident old-ident]] {:db/id old-ident :db/ident new-ident}) renamed-in-wave)
                 _ (retry/with-retry #(d/transact dest-conn {:tx-data rename-txs}))])
-          (retry/with-retry
-            #(d/transact dest-conn {:tx-data wave})))))
-
+          (retry/with-retry #(d/transact dest-conn {:tx-data wave})))))
     {:source-schema schema}))
 
 (defn add-tuple-attrs!

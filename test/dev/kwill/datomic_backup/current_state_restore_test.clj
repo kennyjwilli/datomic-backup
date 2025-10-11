@@ -519,4 +519,142 @@
             (is (= #{"Alice" "Bob" "Charlie"} names)
               "Should read all three names from the database")))))))
 
+(deftest resolve-datom-test
+  (testing "Scalar value types"
+    (let [eid->schema {100 {:db/ident     :person/name
+                            :db/valueType :db.type/string}
+                       101 {:db/ident     :person/age
+                            :db/valueType :db.type/long}
+                       102 {:db/ident     :person/status
+                            :db/valueType :db.type/keyword}}
+          old-id->new-id {1000 "resolved-e-1000"
+                          2000 "resolved-e-2000"}]
+
+      (testing "string value with entity ID in mapping"
+        (let [datom [1000 100 "Alice"]
+              result (csr/resolve-datom datom eid->schema old-id->new-id)]
+          (is (= [:db/add "resolved-e-1000" :person/name "Alice"] (:tx result)))
+          (is (= #{} (:required-eids result)))
+          (is (= "resolved-e-1000" (:resolved-e-id result)))))
+
+      (testing "long value with entity ID not in mapping"
+        (let [datom [9999 101 42]
+              result (csr/resolve-datom datom eid->schema old-id->new-id)]
+          (is (= [:db/add "9999" :person/age 42] (:tx result)))
+          (is (= #{} (:required-eids result)))
+          (is (= "9999" (:resolved-e-id result)))))
+
+      (testing "keyword value"
+        (let [datom [2000 102 :active]
+              result (csr/resolve-datom datom eid->schema old-id->new-id)]
+          (is (= [:db/add "resolved-e-2000" :person/status :active] (:tx result)))
+          (is (= #{} (:required-eids result)))
+          (is (= "resolved-e-2000" (:resolved-e-id result)))))))
+
+  (testing "Reference types"
+    (let [eid->schema {100 {:db/ident     :person/name
+                            :db/valueType :db.type/string}
+                       101 {:db/ident     :person/employer
+                            :db/valueType :db.type/ref}}
+          old-id->new-id {1000 "resolved-e-1000"
+                          2000 "resolved-company-2000"
+                          3000 "resolved-person-3000"}]
+
+      (testing "ref value with entity ID in mapping"
+        (let [datom [1000 101 2000]
+              result (csr/resolve-datom datom eid->schema old-id->new-id)]
+          (is (= [:db/add "resolved-e-1000" :person/employer "resolved-company-2000"] (:tx result)))
+          (is (= #{2000} (:required-eids result)) "Should track ref as required entity")
+          (is (= "resolved-e-1000" (:resolved-e-id result)))))
+
+      (testing "ref value with entity ID not in mapping"
+        (let [datom [3000 101 9999]
+              result (csr/resolve-datom datom eid->schema old-id->new-id)]
+          (is (= [:db/add "resolved-person-3000" :person/employer "9999"] (:tx result)))
+          (is (= #{9999} (:required-eids result)) "Should track unmapped ref as required entity")
+          (is (= "resolved-person-3000" (:resolved-e-id result)))))
+
+      (testing "both entity and ref not in mapping"
+        (let [datom [8888 101 9999]
+              result (csr/resolve-datom datom eid->schema old-id->new-id)]
+          (is (= [:db/add "8888" :person/employer "9999"] (:tx result)))
+          (is (= #{9999} (:required-eids result)))
+          (is (= "8888" (:resolved-e-id result)))))))
+
+  (testing "Heterogeneous tuples (:db/tupleTypes) without refs"
+    (let [eid->schema {100 {:db/ident      :measurement/value
+                            :db/valueType  :db.type/tuple
+                            :db/tupleTypes [:db.type/string :db.type/long :db.type/keyword]}}
+          old-id->new-id {1000 "resolved-e-1000"}]
+
+      (testing "tuple with multiple scalar types"
+        (let [datom [1000 100 ["meters" 42 :metric]]
+              result (csr/resolve-datom datom eid->schema old-id->new-id)]
+          (is (= [:db/add "resolved-e-1000" :measurement/value ["meters" 42 :metric]] (:tx result)))
+          (is (= #{} (:required-eids result)) "No refs in tuple, should have no required entities")
+          (is (= "resolved-e-1000" (:resolved-e-id result)))))))
+
+  (testing "Tuples containing refs"
+    (let [eid->schema {100 {:db/ident      :relationship/data
+                            :db/valueType  :db.type/tuple
+                            :db/tupleTypes [:db.type/ref :db.type/string :db.type/ref]}}
+          old-id->new-id {1000 "resolved-e-1000"
+                          2000 "resolved-person-2000"
+                          3000 "resolved-company-3000"}]
+
+      (testing "tuple with refs - all mapped"
+        (let [datom [1000 100 [2000 "works-at" 3000]]
+              result (csr/resolve-datom datom eid->schema old-id->new-id)]
+          (is (= [:db/add "resolved-e-1000" :relationship/data
+                  ["resolved-person-2000" "works-at" "resolved-company-3000"]]
+                (:tx result)))
+          (is (= #{2000 3000} (:required-eids result)) "Should track all ref entities in tuple")
+          (is (= "resolved-e-1000" (:resolved-e-id result)))))
+
+      (testing "tuple with refs - some unmapped"
+        (let [datom [1000 100 [2000 "reports-to" 9999]]
+              result (csr/resolve-datom datom eid->schema old-id->new-id)]
+          (is (= [:db/add "resolved-e-1000" :relationship/data
+                  ["resolved-person-2000" "reports-to" "9999"]]
+                (:tx result)))
+          (is (= #{2000 9999} (:required-eids result)) "Should track both mapped and unmapped refs")
+          (is (= "resolved-e-1000" (:resolved-e-id result)))))
+
+      (testing "tuple with refs - all unmapped"
+        (let [datom [1000 100 [7777 "connected" 8888]]
+              result (csr/resolve-datom datom eid->schema old-id->new-id)]
+          (is (= [:db/add "resolved-e-1000" :relationship/data
+                  ["7777" "connected" "8888"]]
+                (:tx result)))
+          (is (= #{7777 8888} (:required-eids result)))
+          (is (= "resolved-e-1000" (:resolved-e-id result)))))))
+
+  (testing "Homogeneous tuples (:db/tupleType)"
+    (let [eid->schema {100 {:db/ident     :coordinate/points
+                            :db/valueType :db.type/tuple
+                            :db/tupleType :db.type/long}
+                       101 {:db/ident     :graph/nodes
+                            :db/valueType :db.type/tuple
+                            :db/tupleType :db.type/ref}}
+          old-id->new-id {1000 "resolved-e-1000"
+                          2000 "resolved-node-2000"
+                          3000 "resolved-node-3000"
+                          4000 "resolved-node-4000"}]
+
+      (testing "homogeneous tuple of scalars"
+        (let [datom [1000 100 [10 20 30]]
+              result (csr/resolve-datom datom eid->schema old-id->new-id)]
+          (is (= [:db/add "resolved-e-1000" :coordinate/points [10 20 30]] (:tx result)))
+          (is (= #{} (:required-eids result)) "No refs in scalar tuple")
+          (is (= "resolved-e-1000" (:resolved-e-id result)))))
+
+      (testing "homogeneous tuple of refs - mixed mapped/unmapped"
+        (let [datom [1000 101 [2000 9999 3000]]
+              result (csr/resolve-datom datom eid->schema old-id->new-id)]
+          (is (= [:db/add "resolved-e-1000" :graph/nodes
+                  ["resolved-node-2000" "9999" "resolved-node-3000"]]
+                (:tx result)))
+          (is (= #{2000 9999 3000} (:required-eids result)) "Should track all refs")
+          (is (= "resolved-e-1000" (:resolved-e-id result))))))))
+
 
