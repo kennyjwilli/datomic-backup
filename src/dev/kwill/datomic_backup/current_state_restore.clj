@@ -851,16 +851,12 @@
   
   Pass 1: Process all non-ref attributes
   - Zero pending overhead (no ref dependencies)
-  - Near 100% batch efficiency
-  - Builds complete old-id->new-id mapping
-  - Can use parallel transactions when :tx-parallelism > 1
+  - Can use parallel transactions
   
   Pass 2: Process all ref attributes
-  - Minimal pending (only circular refs)
   - Most refs resolve immediately
   - Always sequential (due to potential circular refs)"
   [{:keys [attrs schema-lookup tx-parallelism] :as argm}]
-  (log/info "Starting current state restore (two-pass mode)")
   (let [{non-ref-attrs :non-ref
          ref-attrs     :ref} (partition-attributes-by-ref
                                (into {}
@@ -869,7 +865,7 @@
                                    (map (juxt :db/ident identity)))
                                  (::impl/schema-raw schema-lookup)))
 
-        _ (log/info "Two-pass strategy"
+        _ (log/info "Starting current state restore (two-pass mode)"
             :total-attributes (count attrs)
             :non-ref-attributes (count non-ref-attrs)
             :ref-attributes (count ref-attrs)
@@ -910,8 +906,8 @@
             :total-transactions (:tx-count pass2-result)
             :total-datoms (:tx-datom-count pass2-result)
             :entities-total (count (:old-id->new-id pass2-result))
-            :avg-tx-ms (if (pos? (:tx-count pass1-result))
-                         (int (/ (:total-tx-time-ms pass1-result) (:tx-count pass1-result)))
+            :avg-tx-ms (if (and pass2-result (pos? (:tx-count pass2-result)))
+                         (int (/ (:total-tx-time-ms pass2-result) (:tx-count pass2-result)))
                          0)
             :duration-sec (int (/ pass2-duration 1000))
             :final-pending-count (reduce + (map count (vals (:pending-index pass2-result)))))
@@ -919,8 +915,8 @@
     {:total-duration-sec (int (/ total-duration 1000))
      :pass1-duration-sec (int (/ pass1-duration 1000))
      :pass2-duration-sec (int (/ pass2-duration 1000))
-     :total-transactions (:tx-count pass2-result)
-     :total-datoms       (:tx-datom-count pass2-result)}))
+     :total-transactions (+ (:tx-count pass1-result) (:tx-count pass2-result 0))
+     :total-datoms       (+ (:tx-datom-count pass1-result) (:tx-datom-count pass2-result 0))}))
 
 (defn restore
   "Restores a database by copying schema and current datom state.
@@ -958,55 +954,3 @@
                            :schema-lookup schema-lookup})
             (add-tuple-attrs! {:dest-conn dest-conn :tuple-schema composite-tuple-schema}))]
     true))
-
-(comment (sc.api/defsc 1)
-  (first passes)
-  (one-restore-pass one-pass-argm (first passes)))
-
-(comment
-  (def testc (d/client {:server-type :datomic-local
-                        :storage-dir :mem
-                        :system      "test"}))
-  (d/create-database testc {:db-name "a"})
-  (def aconn (d/connect testc {:db-name "a"}))
-  (d/transact aconn {:tx-data [{:db/ident :foo}]})
-  (def tx-report *1)
-  (apply max-key :e (:tx-data tx-report))
-
-  (seq (d/datoms (d/db aconn) {:index      :eavt
-                               :components [45]})))
-
-(comment
-  (require 'sc.api)
-  (sc.api/defsc 806)
-  (:tx-count acc)
-  (def samplesc (d/client {:server-type :datomic-local
-                           :system      "datomic-samples"}))
-  (d/list-databases samplesc {})
-  (def source-db (d/db (d/connect samplesc {:db-name "mbrainz-subset"})))
-
-  (def the-e *e)
-
-  (def schema *1)
-  (:language/name schema)
-
-  (def destc (d/client {:server-type :datomic-local
-                        :storage-dir :mem
-                        :system      "dest"}))
-  (d/create-database destc {:db-name "test"})
-  (d/delete-database destc {:db-name "test"})
-  (def dest-conn (d/connect destc {:db-name "test"}))
-
-  (restore
-    {:source-db      source-db
-     :dest-conn      dest-conn
-     :max-batch-size 100})
-
-  (get sm :language/name)
-  (def stx (into []
-             (comp
-               (map (fn [[_ schema]] (walk/postwalk (fn [x] (if (map? x) (dissoc x :db/id) x)) schema)))
-               (distinct))
-             sm))
-  (filter (fn [x]
-            (= :language/name (:db/ident x))) stx))
