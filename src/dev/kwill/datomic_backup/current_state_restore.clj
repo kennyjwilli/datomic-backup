@@ -623,18 +623,18 @@
            read-parallelism
            read-chunk
            init-state
-           attribute-eids]}]
+           attrs]}]
   (log/info "Starting datom read"
     :parallelism read-parallelism
     :chunk-size read-chunk
-    :attribute-count (count attribute-eids))
+    :attribute-count (count attrs))
   (let [*running? (atom true)
         ch (cond-> (async/chan 20000)
              debug
              (monitored-chan! {:runningf     #(deref *running?)
                                :channel-name "datoms"}))
         _ (read-datoms-in-parallel-sync2 source-db
-            {:attribute-eids attribute-eids
+            {:attribute-eids attrs
              :parallelism    read-parallelism
              :dest-ch        ch
              :read-chunk     read-chunk})
@@ -805,8 +805,13 @@
   [db]
   (let [source-schema-lookup (impl/q-schema-lookup db)
         old->new-ident-lookup (impl/build-ident-alias-map db)
+        ignored-attrs #{:db/ensure :db.install/attribute}
         ;; TODO: add support for attr preds (must be done after full restore is done)
-        schema (map #(dissoc % :db.attr/preds) (::impl/schema-raw source-schema-lookup))]
+        schema (into []
+                 (comp
+                   (remove (fn [{:db/keys [ident]}] (contains? ignored-attrs ident)))
+                   (map #(dissoc % :db.attr/preds)))
+                 (::impl/schema-raw source-schema-lookup))]
     {:schema                schema
      :old->new-ident-lookup old->new-ident-lookup}))
 
@@ -816,7 +821,7 @@
   (doseq [tuple-attr tuple-schema
           :let [{:db/keys [tupleAttrs]} tuple-attr]]
     (log/info "Establishing tuple values" :tuple-schema tuple-schema)
-    (let [results (establish-composite-tuple! dest-conn {:tuple-attr-ident (first tupleAttrs) :batch-size 500})]
+    (let [results (establish-composite-tuple! dest-conn {:attr (first tupleAttrs) :batch-size 500})]
       (log/info "Composite tuple establishment complete"
         :tuple-schema tuple-schema
         :success (:success results)
@@ -832,32 +837,30 @@
   Ref attributes include:
   - Direct :db.type/ref attributes
   - Tuples containing at least one ref type (composite, heterogeneous, or homogeneous)"
-  [schema-lookup attribute-eids]
-  (let [eid->schema (::impl/eid->schema schema-lookup)]
-    (group-by
-      (fn [attr-eid]
-        (let [attr-schema (get eid->schema attr-eid)
-              value-type (:db/valueType attr-schema)]
-          (cond
-            ;; Direct ref attribute
-            (= value-type :db.type/ref)
-            :ref
+  [ident->schema]
+  (group-by
+    (fn [attr-schema]
+      (let [value-type (:db/valueType attr-schema)]
+        (cond
+          ;; Direct ref attribute
+          (= value-type :db.type/ref)
+          :ref
 
-            ;; Tuple - check if it contains any ref types
-            (= value-type :db.type/tuple)
-            (let [types (or
-                          ;; Composite tuple - get valueType of each tupleAttr
-                          (->> attr-schema :db/tupleAttrs (map #(get-in eid->schema [% :db/valueType])) seq)
-                          ;; Heterogeneous tuple - explicit types
-                          (:db/tupleTypes attr-schema)
-                          ;; Homogeneous tuple
-                          [(:db/tupleType attr-schema)])]
-              (if (some #{:db.type/ref} types) :ref :non-ref))
+          ;; Tuple - check if it contains any ref types
+          (= value-type :db.type/tuple)
+          (let [types (or
+                        ;; Composite tuple - get valueType of each tupleAttr
+                        (->> attr-schema :db/tupleAttrs (map #(get-in ident->schema [% :db/valueType])))
+                        ;; Heterogeneous tuple - explicit types
+                        (:db/tupleTypes attr-schema)
+                        ;; Homogeneous tuple
+                        [(:db/tupleType attr-schema)])]
+            (if (some #{:db.type/ref} types) :ref :non-ref))
 
-            ;; All other types (string, long, instant, etc.)
-            :else
-            :non-ref)))
-      attribute-eids)))
+          ;; All other types (string, long, instant, etc.)
+          :else
+          :non-ref)))
+    (vals ident->schema)))
 
 (defn restore-two-pass
   "Two-pass restore: non-ref datoms first, then ref datoms.
@@ -875,35 +878,32 @@
   - Minimal pending (only circular refs)
   - Most refs resolve immediately
   - Always sequential (due to potential circular refs)"
-  [{:keys [attribute-eids schema-lookup tx-parallelism] :as argm}]
+  [{:keys [attrs schema-lookup tx-parallelism] :as argm}]
   (log/info "Starting current state restore (two-pass mode)")
-  (let [{non-ref-attrs :non-ref
-         ref-attrs     :ref} (partition-attributes-by-ref schema-lookup attribute-eids)
-
-        tx-parallelism (or tx-parallelism 1)
+  (let [tx-parallelism (or tx-parallelism 1)
+        {non-ref-attrs :non-ref
+         ref-attrs     :ref} (partition-attributes-by-ref
+                               (into {}
+                                 (comp
+                                   (filter #(contains? (set attrs) (:db/ident %)))
+                                   (map (juxt :db/ident identity)))
+                                 (::impl/schema-raw schema-lookup)))
 
         _ (log/info "Two-pass strategy"
-            :total-attributes (count attribute-eids)
+            :total-attributes (count attrs)
             :non-ref-attributes (count non-ref-attrs)
             :ref-attributes (count ref-attrs)
-            :ref-percentage (format "%.1f%%" (* 100.0 (/ (count ref-attrs) (count attribute-eids))))
+            :ref-percentage (format "%.1f%%" (* 100.0 (/ (count ref-attrs) (count attrs))))
             :tx-parallelism tx-parallelism)
 
         ;; PASS 1: Non-ref attributes
         pass1-start (System/currentTimeMillis)
-        _ (log/info "=== PASS 1: Starting non-ref datoms restore ==="
-            :attribute-count (count non-ref-attrs)
-            :mode (if (> tx-parallelism 1) "parallel" "sequential"))
-        pass1-result (if (> tx-parallelism 1)
-                       ;; Use parallel implementation
-                       (pass1-parallel-copy (assoc argm
-                                              :attribute-eids non-ref-attrs
-                                              :schema-lookup schema-lookup
-                                              :tx-parallelism tx-parallelism))
-                       ;; Use sequential implementation
-                       (-full-copy (assoc argm
-                                     :attribute-eids non-ref-attrs
-                                     :schema-lookup schema-lookup)))
+        _ (log/info "=== PASS 1: Starting non-ref datoms restore ===" :attribute-count (count non-ref-attrs))
+        pass1-result (pass1-parallel-copy
+                       (assoc argm
+                         :attribute-eids (map :db/ident non-ref-attrs)
+                         :schema-lookup schema-lookup
+                         :tx-parallelism tx-parallelism))
         pass1-duration (- (System/currentTimeMillis) pass1-start)
         _ (log/info "=== PASS 1: Complete ==="
             :total-transactions (:tx-count pass1-result)
@@ -922,7 +922,7 @@
             :entities-available (count (:old-id->new-id pass1-result)))
         pass2-result (when (seq ref-attrs)
                        (-full-copy (assoc argm
-                                     :attribute-eids ref-attrs
+                                     :attrs (map :db/ident ref-attrs)
                                      :schema-lookup schema-lookup
                                      :init-state pass1-result)))
         pass2-duration (- (System/currentTimeMillis) pass2-start)
@@ -955,13 +955,12 @@
   [{:keys [source-db dest-conn two-pass? tx-parallelism] :as argm}]
   (let [_ (log/info "Starting current state restore")
         tx-parallelism (or tx-parallelism 4)
-        source-schema-lookup (impl/q-schema-lookup source-db)
-        {:keys [schema old->new-ident-lookup]} (get-schema-args source-db)
-
         ;; Copy schema WITHOUT composite tuple attributes
         ;; Composite tuples (:db/tupleAttrs) need to be added after data restore.
         ;; Heterogeneous (:db/tupleTypes) and homogeneous (:db/tupleType) tuples
         ;; are installed with the initial schema.
+        schema-lookup (impl/q-schema-lookup source-db)
+        {:keys [schema old->new-ident-lookup]} (get-schema-args source-db)
         non-composite-tuple-schema (remove :db/tupleAttrs schema)
         _ (log/info "Copying schema (non-composite tuple attributes)"
             :total-attributes (count schema)
@@ -969,28 +968,18 @@
         _ (copy-schema! {:dest-conn             dest-conn
                          :schema                non-composite-tuple-schema
                          :old->new-ident-lookup old->new-ident-lookup})
-        _ (log/info "Schema copy complete")
-
-        ignored-attrs #{:db/ensure :db.install/attribute}
-        non-composite-tuple-attribute-eids
-        (into []
-          (comp
-            (remove (fn [{:db/keys [ident]}] (contains? ignored-attrs ident)))
-            (map (fn [{:db/keys [ident]}]
-                   (get-in source-schema-lookup [::impl/ident->schema ident :db/id]))))
-          non-composite-tuple-schema)
-
         _ (log/info "Starting data restore"
             :two-pass? two-pass?
             :tx-parallelism (when two-pass? tx-parallelism))
+        non-composite-idents (map :db/ident non-composite-tuple-schema)
         result (if two-pass?
                  (restore-two-pass (assoc argm
-                                     :attribute-eids non-composite-tuple-attribute-eids
-                                     :schema-lookup source-schema-lookup
+                                     :attrs non-composite-idents
+                                     :schema-lookup schema-lookup
                                      :tx-parallelism tx-parallelism))
                  (-full-copy (assoc argm
-                               :attribute-eids non-composite-tuple-attribute-eids
-                               :schema-lookup source-schema-lookup)))
+                               :attrs non-composite-idents
+                               :schema-lookup schema-lookup)))
         _ (log/info "Data restore complete" :result result)
 
         composite-tuple-schema (filter :db/tupleAttrs schema)
