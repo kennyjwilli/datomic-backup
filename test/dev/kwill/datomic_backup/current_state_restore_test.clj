@@ -1,5 +1,6 @@
 (ns dev.kwill.datomic-backup.current-state-restore-test
   (:require
+    [clojure.core.async :as async]
     [clojure.test :refer :all]
     [datomic.client.api :as d]
     [dev.kwill.datomic-backup.current-state-restore :as csr]
@@ -467,5 +468,55 @@
                 :db/tupleAttrs [:person/employer :person/name]}}
             (set (:ref result)))
         "Ref should include direct refs and tuples containing refs"))))
+
+(deftest read-datoms-to-chan-test
+  (testing "read-datoms-to-chan! reads datoms for an attribute and writes to channel"
+    (with-open [ctx (testh/test-ctx {})]
+      (let [;; Set up schema and data
+            schema [{:db/ident       :person/name
+                     :db/valueType   :db.type/string
+                     :db/cardinality :db.cardinality/one}
+                    {:db/ident       :person/age
+                     :db/valueType   :db.type/long
+                     :db/cardinality :db.cardinality/one}]
+            _ (d/transact (:source-conn ctx) {:tx-data schema})
+
+            ;; Add test data
+            _ (d/transact (:source-conn ctx)
+                {:tx-data [{:person/name "Alice" :person/age 30}
+                           {:person/name "Bob" :person/age 25}
+                           {:person/name "Charlie" :person/age 35}]})
+
+            source-db (d/db (:source-conn ctx))
+
+            ;; Get the attribute ID for :person/name
+            name-attr-id (:db/id (d/pull source-db '[:db/id] :person/name))
+
+            ;; Create a channel to receive datoms
+            datom-ch (async/chan 100)]
+
+        ;; Read datoms for :person/name attribute
+        (async/thread
+          (csr/read-datoms-to-chan! source-db {:attrid name-attr-id} datom-ch)
+          (async/close! datom-ch))
+
+        ;; Collect datoms from the channel
+        (let [datoms (loop [acc []]
+                       (if-let [datom (async/<!! datom-ch)]
+                         (recur (conj acc datom))
+                         acc))]
+
+          ;; Verify we got the expected number of datoms
+          (is (= 3 (count datoms))
+            "Should read 3 datoms for :person/name attribute")
+
+          ;; Verify all datoms are for the correct attribute
+          (is (every? #(= name-attr-id (:a %)) datoms)
+            "All datoms should have the correct attribute ID")
+
+          ;; Verify the values are what we expect
+          (let [names (set (map :v datoms))]
+            (is (= #{"Alice" "Bob" "Charlie"} names)
+              "Should read all three names from the database")))))))
 
 
