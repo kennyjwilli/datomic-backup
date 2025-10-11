@@ -732,50 +732,38 @@
               next-available
               (conj waves next-wave))))))))
 
-(defn establish-composite!
-  "Reasserts all values of attr, in batches of batch-size, with
-  pacing-sec pause between transactions. This will establish values
-  for any composite attributes built from attr."
-  [conn {:keys [attr batch-size pacing-sec]}]
-  (let [db (d/db conn)
-        es (d/datoms db {:index      :aevt
-                         :components [attr]
-                         :limit      -1})]
-    (doseq [batch (partition-all batch-size es)]
-      (let [es (into #{} (map :e batch))
-            tx-data (map (fn [{:keys [e v]}] [:db/add e attr v]) batch)
-            result (retry/with-retry #(d/transact conn {:tx-data tx-data}))
-            added (transduce
-                    (comp (map :e) (filter es))
-                    (completing (fn [x ids] (inc x)))
-                    0
-                    (:tx-data result))]
-        (log/debug "establish-composite batch complete"
-          :batch-size batch-size
-          :first-e (:e (first batch))
-          :added added)
-        (Thread/sleep (* 1000 pacing-sec))))))
-
 (defn establish-composite-tuple!
-  "Establishes composite tuple values by reasserting one component attribute
-  for each entity. Datomic automatically creates the full composite tuple when
-  any component is reasserted, so we only need to reassert the first component."
-  [conn {:keys [tuple-attr-schema]}]
-  (let [component-attrs (:db/tupleAttrs tuple-attr-schema)
-        db (d/db conn)
-        ;; Use the first component attribute to find all entities
-        first-component (first component-attrs)
-        ;; Get all entities that have the first component attribute
-        entities (d/datoms db {:index      :aevt
-                               :components [first-component]
-                               :limit      -1})]
-    (reduce
-      (fn [acc {:keys [e v]}]
-        ;; Reassert only the first component - Datomic will create the full tuple
-        (retry/with-retry #(d/transact conn {:tx-data [[:db/add e first-component v]]}))
-        (update acc :success inc))
-      {:success 0 :skipped 0}
-      entities)))
+  "Reasserts all values of attr, in batches of batch-size.
+  This will establish values for any composite attributes built from attr."
+  [conn {:keys [attr batch-size]}]
+  (let [db (d/db conn)
+        datom-ch (async/chan 1000)
+        process-batch! (fn [batch]
+                         (when (seq batch)
+                           (let [tx-data (map (fn [{:keys [e a v]}] [:db/add e a v]) batch)
+                                 result (retry/with-retry #(d/transact conn {:tx-data tx-data}))
+                                 added (count (:tempids result))]
+                             (log/info "establish-composite batch complete"
+                               :batch-size (count batch)
+                               :first-e (:e (first batch))
+                               :added added))))]
+    ;; Read datoms with retry support in a separate thread
+    (async/thread
+      (try
+        (read-datoms-with-retry! db {:attrid attr} datom-ch)
+        (finally
+          (async/close! datom-ch))))
+    ;; Process datoms from channel in batches
+    (loop [batch []]
+      (if-let [d (async/<!! datom-ch)]
+        (let [new-batch (conj batch d)]
+          (if (>= (count new-batch) batch-size)
+            (do
+              (process-batch! new-batch)
+              (recur []))
+            (recur new-batch)))
+        ;; Channel closed, process remaining batch if any
+        (process-batch! batch)))))
 
 (defn copy-schema!
   [{:keys [dest-conn schema old->new-ident-lookup]}]
@@ -824,27 +812,15 @@
 
 (defn add-tuple-attrs!
   "Adds tuple attributes to schema and establishes their composite values."
-  [{:keys [dest-conn tuple-schema old->new-ident-lookup]}]
-  (when (seq tuple-schema)
-    (log/info "Adding tupleAttrs to schema after data restore"
-      :tuple-attr-count (count tuple-schema))
-    (copy-schema! {:dest-conn             dest-conn
-                   :schema                tuple-schema
-                   :old->new-ident-lookup old->new-ident-lookup})
-
-    (log/info "Establishing composite tuple values"
-      :tuple-attr-count (count tuple-schema))
-    (doseq [tuple-attr tuple-schema]
-      (log/info "Establishing tuple values"
-        :tuple-attr (:db/ident tuple-attr)
-        :component-attrs (:db/tupleAttrs tuple-attr))
-      (let [results (establish-composite-tuple! dest-conn
-                      {:tuple-attr-schema tuple-attr
-                       :batch-size        500})]
-        (log/info "Composite tuple establishment complete"
-          :tuple-attr (:db/ident tuple-attr)
-          :success (:success results)
-          :skipped (:skipped results))))))
+  [{:keys [dest-conn tuple-schema]}]
+  (doseq [tuple-attr tuple-schema
+          :let [{:db/keys [tupleAttrs]} tuple-attr]]
+    (log/info "Establishing tuple values" :tuple-schema tuple-schema)
+    (let [results (establish-composite-tuple! dest-conn {:tuple-attr-ident (first tupleAttrs) :batch-size 500})]
+      (log/info "Composite tuple establishment complete"
+        :tuple-schema tuple-schema
+        :success (:success results)
+        :skipped (:skipped results)))))
 
 (defn partition-attributes-by-ref
   "Partitions attribute eids into :non-ref and :ref based on their value types.
@@ -1021,9 +997,13 @@
         _ (when (seq composite-tuple-schema)
             (log/info "Processing composite tuple attributes"
               :tuple-attr-count (count composite-tuple-schema)))
-        _ (add-tuple-attrs! {:dest-conn             dest-conn
-                             :tuple-schema          composite-tuple-schema
-                             :old->new-ident-lookup old->new-ident-lookup})]
+        _ (log/info "Adding tupleAttrs to schema after data restore"
+            :tuple-attr-count (count composite-tuple-schema))
+        _ (copy-schema! {:dest-conn             dest-conn
+                         :schema                composite-tuple-schema
+                         :old->new-ident-lookup old->new-ident-lookup})
+        _ (log/info "Establishing composite tuple values")
+        _ (add-tuple-attrs! {:dest-conn dest-conn :tuple-schema composite-tuple-schema})]
     true))
 
 (comment (sc.api/defsc 1)
