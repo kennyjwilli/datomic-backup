@@ -102,10 +102,6 @@
      :required-eids (or req-eids #{})
      :resolved-e-id e-id}))
 
-(comment
-  (sc.api/defsc 41)
-  [92358976733272 86 92358976733273 13194139533319 true])
-
 ;; tx1 [1 :many-ref 2] (should result in empty tx b/c 2 does not exist yet)
 ;; tx2 [2 :name "a] (should know about the relation between [1 :many 2] and add it in
 ;; tx3 [2 :many-ref 3]
@@ -183,23 +179,6 @@
                     (string? resolved-e-id)
                     (assoc-in [:old-id->tempid e] resolved-e-id)))))
       {} datoms-and-pending)))
-
-(defn transact-with-max-batch-size
-  [conn tx-argm max-batch-size]
-  (let [batches (partition-all max-batch-size (:tx-data tx-argm))]
-    (reduce
-      (fn [tx-ret tx-data]
-        (let [{:keys [db-before
-                      db-after
-                      tx-data
-                      tempids]} (d/transact conn (assoc tx-argm :tx-data tx-data))]
-          (cond-> (-> tx-ret
-                    (assoc :db-after db-after)
-                    (update :tx-data #(apply conj % tx-data))
-                    (update :tempids merge tempids))
-            (nil? db-before)
-            (assoc :db-before db-before))))
-      {} batches)))
 
 (defn process-single-batch
   "Process a single batch of datoms, updating the accumulator state."
@@ -287,35 +266,12 @@
 
 (comment (sc.api/defsc 1))
 
-(defn read-datoms-in-parallel-sync
-  [source-db {:keys [dest-ch parallelism]}]
-  (let [a-eids (d/q
-                 {:query '[:find ?a
-                           :where
-                           [:db.part/db :db.install/attribute ?a]]
-                  :limit -1
-                  :args  [source-db]})
-        in-ch (async/chan)]
-    (async/onto-chan!! in-ch a-eids)
-    (async/pipeline-blocking parallelism dest-ch
-      (comp
-        (map first)
-        (mapcat (fn [a-eid]
-                  (try
-                    (d/datoms source-db
-                      {:index      :aevt
-                       :components [a-eid]
-                       :limit      -1})
-                    (catch ExceptionInfo ex (ex-data ex))))))
-      in-ch)
-    dest-ch))
-
-(defn read-datoms-with-retry!
+(defn read-datoms-to-chan!
   [db argm dest-ch]
   (let [;; use start-exclusive b/c we can only set *start after we have SUCCESSFULLY
         ;; received a datom. If we have successfully received the datom, we don't
         ;; want to start there again. Instead, we want to start at the next value.
-        start-exclusive (::start-exclusive argm)
+        start-exclusive (::_start-exclusive argm)
         index-range-argm (cond-> argm
                            start-exclusive
                            (assoc :start start-exclusive))
@@ -330,23 +286,23 @@
       (catch ExceptionInfo ex
         (if (retry/default-retriable? ex)
           (do
-            (read-datoms-with-retry! db (assoc argm ::start-exclusive @*start) dest-ch)
+            (read-datoms-to-chan! db (assoc argm ::_start-exclusive @*start) dest-ch)
             (log/warn "Retryable anomaly while reading datoms. Retrying with :start set..."
               :anomaly (ex-data ex)
               :start-exclusive @*start))
           (throw ex))))))
 
-(defn read-datoms-in-parallel-sync2
-  [source-db {:keys [attribute-eids dest-ch parallelism read-chunk]}]
+(defn read-datoms-in-parallel
+  [source-db {:keys [attrs dest-ch parallelism read-chunk]}]
   (let [exec (Executors/newFixedThreadPool parallelism)
         done-ch (async/chan)
         start-time (System/currentTimeMillis)]
-    (doseq [a attribute-eids]
+    (doseq [a attrs]
       (.submit exec ^Runnable
         (fn []
           (log/debug "Start reading datoms..." :attrid a)
           (try
-            (read-datoms-with-retry! source-db
+            (read-datoms-to-chan! source-db
               {:attrid a
                :chunk  read-chunk
                :limit  -1}
@@ -356,11 +312,11 @@
     (async/go-loop [n 0]
       (let [attr (async/<! done-ch)]
         (log/debug "Done reading attr." :attrid attr))
-      (if (< (inc n) (count attribute-eids))
+      (if (< (inc n) (count attrs))
         (recur (inc n))
         (let [duration (- (System/currentTimeMillis) start-time)]
           (log/info "All attributes read complete"
-            :total-attributes (count attribute-eids)
+            :total-attributes (count attrs)
             :duration-ms duration
             :duration-sec (int (/ duration 1000)))
           (async/close! dest-ch)
@@ -381,40 +337,6 @@
 (defn <anom!!
   [ch]
   (-> ch async/<!! anom!))
-
-(defn unchunk
-  [ch]
-  (async/transduce (halt-when :cognitect.anomalies/category) into [] ch))
-
-(defn read-datoms-in-parallel-async
-  [a-source-db {:keys [dest-ch parallelism]}]
-  (let [a-eids (-> (d.a/q
-                     {:query '[:find ?a
-                               :where
-                               [:db.part/db :db.install/attribute ?a]]
-                      :limit -1
-                      :args  [a-source-db]})
-                 (unchunk)
-                 (<anom!!))
-        in-ch (async/chan)]
-    (async/onto-chan!! in-ch a-eids)
-    (async/pipeline-async parallelism dest-ch
-      (fn [[a-eid] result-ch]
-        (let [ds-ch (d.a/datoms a-source-db
-                      {:index      :aevt
-                       :components [a-eid]
-                       :chunk      1000
-                       :limit      -1})]
-          (async/go-loop []
-            (if-some [ds (async/<! ds-ch)]
-              (if (:cognitect.anomalies/category ds)
-                (do (async/>! result-ch ds) (async/close! result-ch))
-                (do
-                  (doseq [d ds] (async/>! result-ch d))
-                  (recur)))
-              (async/close! result-ch)))))
-      in-ch)
-    dest-ch))
 
 (defn monitored-chan!
   [ch {:keys [runningf channel-name every-ms]
@@ -541,20 +463,20 @@
   Pipeline:
   [Datom Reader] → [Batcher] → [Work Queue] → [N Workers] → [Results Collector]"
   [{:keys [source-db
-           schema-lookup
            dest-conn
+           schema-lookup
            max-batch-size
            debug
            read-parallelism
            read-chunk
            tx-parallelism
-           attribute-eids]}]
+           attrs]}]
   (log/info "Starting Pass 1 parallel datom copy"
     :read-parallelism read-parallelism
     :tx-parallelism tx-parallelism
     :chunk-size read-chunk
     :batch-size max-batch-size
-    :attribute-count (count attribute-eids))
+    :attribute-count (count attrs))
 
   (let [eid->schema (::impl/eid->schema schema-lookup)
         max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
@@ -566,11 +488,11 @@
         result-ch (async/chan 100)
 
         ;; Start datom reader
-        _ (read-datoms-in-parallel-sync2 source-db
-            {:attribute-eids attribute-eids
-             :parallelism    read-parallelism
-             :dest-ch        datom-ch
-             :read-chunk     read-chunk})
+        _ (read-datoms-in-parallel source-db
+            {:attrs       attrs
+             :parallelism read-parallelism
+             :dest-ch     datom-ch
+             :read-chunk  read-chunk})
 
         ;; Start batcher thread
         batcher-thread (async/thread
@@ -633,11 +555,11 @@
              debug
              (monitored-chan! {:runningf     #(deref *running?)
                                :channel-name "datoms"}))
-        _ (read-datoms-in-parallel-sync2 source-db
-            {:attribute-eids attrs
-             :parallelism    read-parallelism
-             :dest-ch        ch
-             :read-chunk     read-chunk})
+        _ (read-datoms-in-parallel source-db
+            {:attrs       attrs
+             :parallelism read-parallelism
+             :dest-ch     ch
+             :read-chunk  read-chunk})
         eid->schema (::impl/eid->schema schema-lookup)
         max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
         schema-ids (into #{} (map key) eid->schema)
@@ -750,7 +672,7 @@
     ;; Read datoms with retry support in a separate thread
     (async/thread
       (try
-        (read-datoms-with-retry! db {:attrid attr} datom-ch)
+        (read-datoms-to-chan! db {:attrid attr} datom-ch)
         (finally
           (async/close! datom-ch))))
     ;; Process datoms from channel in batches
@@ -888,7 +810,7 @@
         _ (log/info "=== PASS 1: Starting non-ref datoms restore ===" :attribute-count (count non-ref-attrs))
         pass1-result (pass1-parallel-copy
                        (assoc argm
-                         :attribute-eids (map :db/ident non-ref-attrs)
+                         :attrs (map :db/ident non-ref-attrs)
                          :schema-lookup schema-lookup
                          :tx-parallelism tx-parallelism))
         pass1-duration (- (System/currentTimeMillis) pass1-start)
