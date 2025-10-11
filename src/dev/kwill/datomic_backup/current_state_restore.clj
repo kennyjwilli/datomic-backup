@@ -219,9 +219,7 @@
         (let [tx-start (System/currentTimeMillis)
               {:keys [tempids
                       tx-data]} (try
-                                  (retry/with-retry #(d/transact dest-conn {:tx-data tx-data})
-                                    {:backoff (retry/capped-exponential-backoff-with-jitter
-                                                {:max-retries 20})})
+                                  (retry/with-retry #(d/transact dest-conn {:tx-data tx-data}))
                                   (catch Exception ex
                                     (sc.api/spy)
                                     (throw ex)))
