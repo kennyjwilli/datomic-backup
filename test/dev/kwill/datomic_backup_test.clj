@@ -283,11 +283,8 @@
       (run-restore-test ctx
         (:schema scenario)
         (fn [ctx]
-          (backup/current-state-restore {:source-db        (d/db (:source-conn ctx))
-                                         :dest-conn        (:dest-conn ctx)
-                                         :max-batch-size   100
-                                         :read-parallelism 4
-                                         :read-chunk       1000}))
+          (backup/current-state-restore {:source-db (d/db (:source-conn ctx))
+                                         :dest-conn (:dest-conn ctx)}))
         (:assertions scenario)))))
 
 ;(deftest tuple-scenarios-restore-db

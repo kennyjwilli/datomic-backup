@@ -143,19 +143,19 @@
   - :read-parallelism - Parallel attribute reads (default 20)
   - :read-chunk - Datoms per read chunk (default 5000)
   - :debug - Enable debug logging (default false)
-  - :two-pass? - Use two-pass strategy: non-ref then ref datoms (default false)
-                 Can provide 1.5-2.5x speedup for databases with many ref attributes"
-  [{:keys [source-db dest-conn max-batch-size read-parallelism read-chunk debug two-pass?]
+  - :tx-parallelism - parallelism for transaction worker (default 4)"
+  [{:keys [source-db dest-conn max-batch-size read-parallelism read-chunk debug tx-parallelism]
     :or   {max-batch-size   500
            read-parallelism 20
-           read-chunk       5000}}]
+           read-chunk       5000
+           tx-parallelism   4}}]
   (cs-restore/restore
     (cond-> {:source-db        source-db
              :dest-conn        dest-conn
              :max-batch-size   max-batch-size
              :read-parallelism read-parallelism
              :read-chunk       read-chunk
-             :two-pass?        (boolean two-pass?)}
+             :tx-parallelism   tx-parallelism}
       debug (assoc :debug debug))))
 
 (comment

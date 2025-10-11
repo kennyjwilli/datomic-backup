@@ -855,14 +855,9 @@
   "Restores a database by copying schema and current datom state.
 
   Options:
-  - :two-pass? - If true, uses two-pass strategy (non-ref then ref datoms).
-                 Default: false (single-pass with pending resolution)
-  - :tx-parallelism - Number of parallel transaction workers for Pass 1 in two-pass mode.
-                      Only used when :two-pass? is true.
-                      Default: 4"
-  [{:keys [source-db dest-conn two-pass? tx-parallelism] :as argm}]
+  - :tx-parallelism - Number of parallel transaction workers for Pass 1 in two-pass mode."
+  [{:keys [source-db dest-conn tx-parallelism] :as argm}]
   (let [_ (log/info "Starting current state restore")
-        tx-parallelism (or tx-parallelism 4)
         ;; Copy schema WITHOUT composite tuple attributes
         ;; Composite tuples (:db/tupleAttrs) need to be added after data restore.
         ;; Heterogeneous (:db/tupleTypes) and homogeneous (:db/tupleType) tuples
@@ -875,17 +870,11 @@
         _ (copy-schema! {:dest-conn     dest-conn
                          :attrs         non-composite-attrs
                          :schema-lookup schema-lookup})
-        _ (log/info "Starting data restore"
-            :two-pass? two-pass?
-            :tx-parallelism (when two-pass? tx-parallelism))
-        result (if two-pass?
-                 (restore-two-pass (assoc argm
-                                     :attrs non-composite-attrs
-                                     :schema-lookup schema-lookup
-                                     :tx-parallelism tx-parallelism))
-                 (-full-copy (assoc argm
-                               :attrs non-composite-attrs
-                               :schema-lookup schema-lookup)))
+        _ (log/info "Starting data restore" :tx-parallelism tx-parallelism)
+        result (restore-two-pass (assoc argm
+                                   :attrs non-composite-attrs
+                                   :schema-lookup schema-lookup
+                                   :tx-parallelism tx-parallelism))
         _ (log/info "Data restore complete" :result result)
 
         composite-tuple-schema (filter :db/tupleAttrs (::impl/schema-raw schema-lookup))
