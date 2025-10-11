@@ -109,7 +109,7 @@
 ;;    2) eid will be transacted in this transaction. only true if
 
 (defn txify-datoms
-  [datoms pending-index eid->schema old-id->new-id newly-created-eids]
+  [datoms pending-index eid->schema old-id->new-id]
   (let [;; an attempt to add a tuple or ref value pointing to an eid NOT in this
         ;; set should be attempted later
         eids-exposed (into (set (keys old-id->new-id))
@@ -137,25 +137,6 @@
                               (filter (fn [{:keys [waiting-for]}] (empty? waiting-for))))
                             potentially-ready-pending)
         datoms-and-pending (concat datoms (map :datom retryable-pending))]
-
-    ;; Diagnostic: Log detailed info about pending resolution
-    (when (and (seq pending-index) (< (count retryable-pending) (count potentially-ready-pending)))
-      (let [total-pending (reduce + (map count (vals pending-index)))
-            still-pending (- (count potentially-ready-pending) (count retryable-pending))
-            sample-stuck (first (remove (fn [{:keys [waiting-for]}] (empty? waiting-for))
-                                  (map (fn [{:keys [required-eids] :as p}]
-                                         (assoc p :waiting-for (sets/difference required-eids eids-exposed)))
-                                    potentially-ready-pending)))]
-        (log/info "Pending datom analysis"
-          :total-pending total-pending
-          :checked-pending (count potentially-ready-pending)
-          :retryable (count retryable-pending)
-          :still-waiting still-pending
-          :eids-exposed-count (count eids-exposed)
-          :newly-created-count (count newly-created-eids)
-          :sample-stuck-datom (:datom sample-stuck)
-          :sample-waiting-for (:waiting-for sample-stuck))))
-
     (reduce (fn [acc [e a :as datom]]
               (if (= :db/txInstant (get-in eid->schema [a :db/ident]))
                 ;; not actually used, only collected for reporting purposes
@@ -178,13 +159,13 @@
 
 (defn process-single-batch
   "Process a single batch of datoms, updating the accumulator state."
-  [{:keys [old-id->new-id newly-created-eids pending-index dest-conn eid->schema debug] :as acc}
+  [{:keys [old-id->new-id pending-index dest-conn eid->schema debug] :as acc}
    batch]
   (let [{:keys [old-id->tempid
                 tx-data
                 tx-eids
                 pending-datoms]}
-        (txify-datoms batch pending-index eid->schema old-id->new-id newly-created-eids)]
+        (txify-datoms batch pending-index eid->schema old-id->new-id)]
 
     ;; Diagnostic: Log when we're not making progress
     (when (and debug
@@ -225,12 +206,8 @@
                                            (when-let [eid (get tempids tempid)]
                                              [old-id eid])))
                                     old-id->tempid)
-              ;; Track which old entity IDs were just created in this transaction
-              next-newly-created-eids (into #{} (map first) old-id->tempid)
               next-acc (-> acc
-                         (assoc
-                           :old-id->new-id next-old-id->new-id
-                           :newly-created-eids next-newly-created-eids)
+                         (assoc :old-id->new-id next-old-id->new-id)
                          (update :input-datom-count (fnil + 0) (count batch))
                          (update :tx-count (fnil inc 0))
                          (update :tx-datom-count (fnil + 0) (count tx-data))
@@ -427,7 +404,7 @@
                      (let [tx-start (System/currentTimeMillis)
                            ;; txify-datoms with current worker's old-id->new-id state
                            {:keys [tx-data old-id->tempid]}
-                           (txify-datoms batch {} eid->schema old-id->new-id #{})
+                           (txify-datoms batch {} eid->schema old-id->new-id)
 
                            ;; Transact
                            {:keys [tempids tx-data]}
@@ -596,7 +573,6 @@
       ;; Return state in same format as -full-copy
       (assoc final-state
         :tx-eids #{}
-        :newly-created-eids #{}
         :pending-index {}
         :dest-conn dest-conn
         :eid->schema eid->schema
@@ -635,7 +611,6 @@
                            :tx-datom-count     0
                            :tx-eids            #{}
                            :total-tx-time-ms   0
-                           :newly-created-eids #{}
                            :pending-index      {}
                            :dest-conn          dest-conn
                            :eid->schema        eid->schema

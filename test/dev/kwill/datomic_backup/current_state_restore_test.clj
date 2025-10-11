@@ -679,7 +679,7 @@
           datoms [(testh/make-datom 2000 100 "Bob" 1234)]
 
           ;; Call txify-datoms
-          result (csr/txify-datoms datoms pending-index eid->schema old-id->new-id #{})]
+          result (csr/txify-datoms datoms pending-index eid->schema old-id->new-id)]
 
       ;; Verify both the new entity and the previously-pending ref are in tx-data
       (is (= 2 (count (:tx-data result)))
@@ -724,7 +724,7 @@
                   (testh/make-datom 5000 103 [9999 "unknown" 7] 1004) ;; Tuple with ref to non-existent - should pend
                   (testh/make-datom 999 50 #inst "2024-01-01" 1005)] ;; txInstant - special handling
 
-          result (csr/txify-datoms datoms {} eid->schema old-id->new-id #{})]
+          result (csr/txify-datoms datoms {} eid->schema old-id->new-id)]
 
       ;; Verify scalars and available refs are processed
       ;; NOTE: Entity 2000 is created in this batch, so the ref from 1000->2000 is also processed
