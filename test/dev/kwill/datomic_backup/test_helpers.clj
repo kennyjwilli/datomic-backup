@@ -11,6 +11,17 @@
   (doto (File/createTempFile "datomic-backup-test" "")
     (.deleteOnExit)))
 
+(defrecord TestDatom [e a v tx]
+  clojure.lang.Indexed
+  (nth [_ i] (case i 0 e 1 a 2 v 3 tx))
+  (nth [_ i not-found] (case i 0 e 1 a 2 v 3 tx not-found)))
+
+(defn make-datom
+  "Creates a datom-like object that supports both map access (:e, :a, :v, :tx)
+  and sequential destructuring [e a v tx], matching Datomic datom behavior."
+  [e a v tx]
+  (map->TestDatom {:e e :a a :v v :tx tx}))
+
 (def example-schema
   [{:db/ident       :student/first
     :db/valueType   :db.type/string
