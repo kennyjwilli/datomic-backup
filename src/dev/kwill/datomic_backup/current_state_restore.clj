@@ -453,6 +453,8 @@
             nil)))                                          ; Terminate worker on error
       nil)))
 
+(comment (sc.api/defsc 1))
+
 (defn collect-results!
   "Collects results from workers and merges them into final state.
   Logs progress every 10 transactions when debug is enabled.
@@ -705,7 +707,7 @@
                          (when (seq batch)
                            (let [tx-data (map (fn [{:keys [e a v]}] [:db/add e a v]) batch)
                                  result (retry/with-retry #(d/transact conn {:tx-data tx-data}))
-                                 added (count (:tempids result))]
+                                 added (count (:tx-data result))]
                              (log/info "establish-composite batch complete"
                                :batch-size (count batch)
                                :first-e (:e (first batch))
@@ -764,12 +766,10 @@
   [{:keys [dest-conn tuple-schema]}]
   (doseq [tuple-attr tuple-schema
           :let [{:db/keys [tupleAttrs]} tuple-attr]]
-    (log/info "Establishing tuple values" :tuple-schema tuple-schema)
-    (let [results (establish-composite-tuple! dest-conn {:attr (first tupleAttrs) :batch-size 500})]
+    (log/info "Establishing tuple values" :attr (:db/ident tuple-schema) :tuple-attrs (:db/tupleAttrs tuple-schema))
+    (let [_ (establish-composite-tuple! dest-conn {:attr (first tupleAttrs) :batch-size 500})]
       (log/info "Composite tuple establishment complete"
-        :tuple-schema tuple-schema
-        :success (:success results)
-        :skipped (:skipped results)))))
+        :attr (:db/ident tuple-schema)))))
 
 (defn partition-attributes-by-ref
   "Partitions attribute eids into :non-ref and :ref based on their value types.
@@ -853,6 +853,7 @@
                          0)
             :duration-sec (int (/ pass1-duration 1000))
             :final-pending-count (reduce + (map count (vals (:pending-index pass1-result)))))
+        _ (sc.api/spy)
 
         ;; PASS 2: Ref attributes (always sequential)
         pass2-start (System/currentTimeMillis)
@@ -905,6 +906,7 @@
                                    :attrs non-composite-attrs
                                    :schema-lookup schema-lookup
                                    :tx-parallelism tx-parallelism))
+        _ (sc.api/spy)
         _ (log/info "Data restore complete" :result result)
 
         composite-tuple-schema (filter :db/tupleAttrs (::impl/schema-raw schema-lookup))
