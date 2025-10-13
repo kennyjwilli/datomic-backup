@@ -733,6 +733,16 @@
         ;; Channel closed, process remaining batch if any
         (process-batch! batch)))))
 
+(defn tempids->old-id-mapping
+  "Extracts old-id->new-id mapping from transaction result's :tempids.
+  Tempid keys are strings representing old entity IDs."
+  [tempids]
+  (into {}
+    (keep (fn [[tempid-str new-id]]
+            (when-let [old-id (parse-long tempid-str)]
+              [old-id new-id])))
+    tempids))
+
 (defn copy-schema!
   [{:keys [dest-conn schema-lookup attrs]}]
   (let [new->old-ident-lookup (sets/map-invert (::impl/old->new-ident-lookup schema-lookup))
@@ -760,33 +770,33 @@
                     renamed-map (into {} renamed-in-wave)]
                 (log/info "Installing schema wave" :wave (inc wave-idx) :attributes (count wave))
                 (if (seq renamed-map)
-                  (let [wave-with-old-idents (mapv (fn [attr]
-                                                     (if-let [old-ident (get renamed-map (:db/ident attr))]
-                                                       (assoc attr :db/ident old-ident)
-                                                       attr))
-                                               wave)
-                        _ (retry/with-retry #(d/transact dest-conn {:tx-data wave-with-old-idents}))
-                        ;; Query dest db to get new entity IDs for the attributes we just created
-                        dest-db (d/db dest-conn)
-                        wave-mappings (into {}
-                                        (keep (fn [attr]
-                                                (when-let [source-eid (get ident->source-eid (:db/ident attr))]
-                                                  (let [dest-eid (:db/id (d/pull dest-db [:db/id] (:db/ident attr)))]
-                                                    [source-eid dest-eid]))))
-                                        wave)
+                  ;; Renamed attributes: transact with old idents and tempids
+                  (let [wave-with-tempids (mapv (fn [attr]
+                                                  (let [attr-ident (:db/ident attr)
+                                                        old-ident (get renamed-map attr-ident attr-ident)
+                                                        source-eid (get ident->source-eid attr-ident)]
+                                                    (when-not source-eid (throw (ex-info "Missing source-eid" {:attr-ident attr-ident})))
+                                                    (assoc attr
+                                                      :db/ident old-ident
+                                                      :db/id (str source-eid))))
+                                            wave)
+                        tx-result (retry/with-retry #(d/transact dest-conn {:tx-data wave-with-tempids}))
+                        wave-mappings (tempids->old-id-mapping (:tempids tx-result))
                         updated-mappings (merge old-id->new-id wave-mappings)
-                        rename-txs (mapv (fn [[new-ident old-ident]] {:db/id old-ident :db/ident new-ident}) renamed-in-wave)
+                        ;; Now transact the renames
+                        rename-txs (mapv (fn [[new-ident old-ident]]
+                                           {:db/id old-ident :db/ident new-ident})
+                                     renamed-in-wave)
                         _ (retry/with-retry #(d/transact dest-conn {:tx-data rename-txs}))]
                     updated-mappings)
-                  (let [_ (retry/with-retry #(d/transact dest-conn {:tx-data wave}))
-                        ;; Query dest db to get new entity IDs for the attributes we just created
-                        dest-db (d/db dest-conn)
-                        wave-mappings (into {}
-                                        (keep (fn [attr]
-                                                (when-let [source-eid (get ident->source-eid (:db/ident attr))]
-                                                  (let [dest-eid (:db/id (d/pull dest-db [:db/id] (:db/ident attr)))]
-                                                    [source-eid dest-eid]))))
-                                        wave)]
+                  ;; Non-renamed attributes: transact with tempids
+                  (let [wave-with-tempids (mapv (fn [attr]
+                                                  (let [source-eid (get ident->source-eid (:db/ident attr))]
+                                                    (when-not source-eid (throw (ex-info "Missing source-eid" {:attr-ident (:db/ident attr)})))
+                                                    (assoc attr :db/id (str source-eid))))
+                                            wave)
+                        tx-result (retry/with-retry #(d/transact dest-conn {:tx-data wave-with-tempids}))
+                        wave-mappings (tempids->old-id-mapping (:tempids tx-result))]
                     (merge old-id->new-id wave-mappings)))))
             {}
             (map-indexed vector waves))]
