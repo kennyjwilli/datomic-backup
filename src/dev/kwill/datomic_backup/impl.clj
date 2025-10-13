@@ -378,19 +378,28 @@
     ;; db/ensure is technically asserted on user-land entities, but we don't support it yet here
     :db/ensure})
 
+(defn- update-when [m k f & args]
+  (if (contains? m k)
+    (apply update m k f args)
+    m))
+
 (defn schema-result->lookup
   [user-schema]
   (reduce
     (fn [lookup {:db/keys [id ident] :as schema}]
       (if (contains? datomic-internal-attrs ident)
         lookup
-        (-> lookup
-          (update ::schema-raw (fnil conj [])
-            (walk/postwalk
-              (fn [x] (if (map? x) (dissoc x :db/id) x))
-              schema))
-          (assoc-in [::eid->schema id] schema)
-          (assoc-in [::ident->schema ident] schema))))
+        (let [cleaned-schema (-> schema
+                               (update-when :db/valueType :db/ident)
+                               (update-when :db/cardinality :db/ident)
+                               (update-when :db/unique :db/ident))]
+          (-> lookup
+            (update ::schema-raw (fnil conj [])
+              (walk/postwalk
+                (fn [x] (if (map? x) (dissoc x :db/id) x))
+                cleaned-schema))
+            (assoc-in [::eid->schema id] cleaned-schema)
+            (assoc-in [::ident->schema ident] cleaned-schema)))))
     {} user-schema))
 
 (defn datomic-schema-ident?
@@ -408,7 +417,8 @@
                             :limit -1})
         user-schema (into []
                       (comp
-                        (map first)
+                        (map (fn [[schema]]
+                               (into {} (filter (fn [[k]] (datomic-schema-ident? k))) schema)))
                         (remove (comp datomic-schema-ident? :db/ident)))
                       schema-result)
         old->new-ident-lookup (get-old->new-ident-lookup db)]
