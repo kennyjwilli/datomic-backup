@@ -24,11 +24,20 @@
                            :db/cardinality :db.cardinality/many}]
             _ (d/transact (:source-conn ctx) {:tx-data basic-schema})
             source-db (d/db (:source-conn ctx))
-            schema-lookup (impl/q-schema-lookup source-db)]
+            schema-lookup (impl/q-schema-lookup source-db)
+            result (csr/copy-schema! {:dest-conn     (:dest-conn ctx)
+                                      :schema-lookup schema-lookup
+                                      :attrs         (map :db/ident (::impl/schema-raw schema-lookup))})]
 
-        (csr/copy-schema! {:dest-conn     (:dest-conn ctx)
-                           :schema-lookup schema-lookup
-                           :attrs         (map :db/ident (::impl/schema-raw schema-lookup))})
+        ;; Verify old-id->new-id mapping is returned
+        (is (map? (:old-id->new-id result)) "Should return old-id->new-id map")
+        (is (= (count basic-schema) (count (:old-id->new-id result)))
+          "Should have mapping for each schema attribute")
+
+        ;; Verify all mappings are valid (old-id and new-id are both numbers)
+        (doseq [[old-id new-id] (:old-id->new-id result)]
+          (is (number? old-id) "Old ID should be a number")
+          (is (number? new-id) "New ID should be a number"))
 
         (let [dest-db (d/db (:dest-conn ctx))
               dest-schema-lookup (impl/q-schema-lookup dest-db)]
@@ -232,7 +241,7 @@
                                       :schema-lookup {::impl/schema-raw            []
                                                       ::impl/old->new-ident-lookup {}}
                                       :attrs         []})]
-        (is (= {:source-schema []} result)))))
+        (is (= {:source-schema [] :old-id->new-id {}} result)))))
 
   (testing "Schema with unique constraint"
     (with-open [ctx (testh/test-ctx {})]

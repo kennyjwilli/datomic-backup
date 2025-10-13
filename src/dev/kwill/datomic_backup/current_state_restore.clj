@@ -459,12 +459,13 @@
   "Collects results from workers and merges them into final state.
   Logs progress every 10 transactions when debug is enabled.
   Returns when result-ch is closed."
-  [result-ch debug]
-  (loop [acc {:old-id->new-id    {}
-              :tx-count          0
-              :tx-datom-count    0
-              :total-tx-time-ms  0
-              :input-datom-count 0}]
+  [result-ch debug init-state]
+  (loop [acc (merge {:old-id->new-id    {}
+                     :tx-count          0
+                     :tx-datom-count    0
+                     :total-tx-time-ms  0
+                     :input-datom-count 0}
+               init-state)]
     (if-let [result (async/<!! result-ch)]
       (if (:error result)
         ;; Error occurred, propagate it
@@ -509,13 +510,15 @@
            read-parallelism
            read-chunk
            tx-parallelism
+           init-state
            attrs]}]
   (log/info "Starting Pass 1 parallel datom copy"
     :read-parallelism read-parallelism
     :tx-parallelism tx-parallelism
     :chunk-size read-chunk
     :batch-size max-batch-size
-    :attribute-count (count attrs))
+    :attribute-count (count attrs)
+    :init-state-entities (count (:old-id->new-id init-state)))
 
   (let [eid->schema (::impl/eid->schema schema-lookup)
         max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
@@ -549,8 +552,8 @@
                                  eid->schema debug (str "worker-" idx)))))
                          worker-channels)
 
-        ;; Start result collector in a thread
-        collector-thread (async/thread (collect-results! result-ch debug))]
+        ;; Start result collector in a thread with init-state
+        collector-thread (async/thread (collect-results! result-ch debug init-state))]
 
     ;; Wait for batcher to finish (closes all worker channels)
     (async/<!! batcher-thread)
@@ -607,16 +610,16 @@
         eid->schema (::impl/eid->schema schema-lookup)
         max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
         schema-ids (into #{} (map key) eid->schema)
-        init-state (merge {:input-datom-count  0
-                           :old-id->new-id     {}
-                           :tx-count           0
-                           :tx-datom-count     0
-                           :tx-eids            #{}
-                           :total-tx-time-ms   0
-                           :pending-index      {}
-                           :dest-conn          dest-conn
-                           :eid->schema        eid->schema
-                           :debug              debug}
+        init-state (merge {:input-datom-count 0
+                           :old-id->new-id    {}
+                           :tx-count          0
+                           :tx-datom-count    0
+                           :tx-eids           #{}
+                           :total-tx-time-ms  0
+                           :pending-index     {}
+                           :dest-conn         dest-conn
+                           :eid->schema       eid->schema
+                           :debug             debug}
                      init-state)]
     (try
       (loop [acc init-state
@@ -740,26 +743,55 @@
                    ;; TODO: add support for attr preds (must be done after full restore is done)
                    (map #(dissoc % :db.attr/preds)))
                  (::impl/schema-raw schema-lookup))
-        waves (partition-schema-by-deps schema)]
+        waves (partition-schema-by-deps schema)
+        ;; Build ident->source-eid map from eid->schema
+        ident->source-eid (into {}
+                            (map (fn [[eid schema-map]]
+                                   [(:db/ident schema-map) eid]))
+                            (::impl/eid->schema schema-lookup))]
     (log/info "Installing schema" :total-attributes (count schema) :waves (count waves))
-    (doseq [[wave-idx wave] (map-indexed vector waves)]
-      (let [renamed-in-wave (keep (fn [attr]
-                                    (when-let [old-ident (new->old-ident-lookup (:db/ident attr))]
-                                      [(:db/ident attr) old-ident]))
-                              wave)
-            renamed-map (into {} renamed-in-wave)]
-        (log/info "Installing schema wave" :wave (inc wave-idx) :attributes (count wave))
-        (if (seq renamed-map)
-          (let [wave-with-old-idents (mapv (fn [attr]
-                                             (if-let [old-ident (get renamed-map (:db/ident attr))]
-                                               (assoc attr :db/ident old-ident)
-                                               attr))
-                                       wave)
-                _ (retry/with-retry #(d/transact dest-conn {:tx-data wave-with-old-idents}))
-                rename-txs (mapv (fn [[new-ident old-ident]] {:db/id old-ident :db/ident new-ident}) renamed-in-wave)
-                _ (retry/with-retry #(d/transact dest-conn {:tx-data rename-txs}))])
-          (retry/with-retry #(d/transact dest-conn {:tx-data wave})))))
-    {:source-schema schema}))
+    (let [old-id->new-id
+          (reduce
+            (fn [old-id->new-id [wave-idx wave]]
+              (let [renamed-in-wave (keep (fn [attr]
+                                            (when-let [old-ident (new->old-ident-lookup (:db/ident attr))]
+                                              [(:db/ident attr) old-ident]))
+                                      wave)
+                    renamed-map (into {} renamed-in-wave)]
+                (log/info "Installing schema wave" :wave (inc wave-idx) :attributes (count wave))
+                (if (seq renamed-map)
+                  (let [wave-with-old-idents (mapv (fn [attr]
+                                                     (if-let [old-ident (get renamed-map (:db/ident attr))]
+                                                       (assoc attr :db/ident old-ident)
+                                                       attr))
+                                               wave)
+                        _ (retry/with-retry #(d/transact dest-conn {:tx-data wave-with-old-idents}))
+                        ;; Query dest db to get new entity IDs for the attributes we just created
+                        dest-db (d/db dest-conn)
+                        wave-mappings (into {}
+                                        (keep (fn [attr]
+                                                (when-let [source-eid (get ident->source-eid (:db/ident attr))]
+                                                  (let [dest-eid (:db/id (d/pull dest-db [:db/id] (:db/ident attr)))]
+                                                    [source-eid dest-eid]))))
+                                        wave)
+                        updated-mappings (merge old-id->new-id wave-mappings)
+                        rename-txs (mapv (fn [[new-ident old-ident]] {:db/id old-ident :db/ident new-ident}) renamed-in-wave)
+                        _ (retry/with-retry #(d/transact dest-conn {:tx-data rename-txs}))]
+                    updated-mappings)
+                  (let [_ (retry/with-retry #(d/transact dest-conn {:tx-data wave}))
+                        ;; Query dest db to get new entity IDs for the attributes we just created
+                        dest-db (d/db dest-conn)
+                        wave-mappings (into {}
+                                        (keep (fn [attr]
+                                                (when-let [source-eid (get ident->source-eid (:db/ident attr))]
+                                                  (let [dest-eid (:db/id (d/pull dest-db [:db/id] (:db/ident attr)))]
+                                                    [source-eid dest-eid]))))
+                                        wave)]
+                    (merge old-id->new-id wave-mappings)))))
+            {}
+            (map-indexed vector waves))]
+      {:source-schema  schema
+       :old-id->new-id old-id->new-id})))
 
 (defn add-tuple-attrs!
   "Adds tuple attributes to schema and establishes their composite values."
@@ -819,7 +851,7 @@
   Pass 2: Process all ref attributes
   - Most refs resolve immediately
   - Always sequential (due to potential circular refs)"
-  [{:keys [attrs schema-lookup tx-parallelism] :as argm}]
+  [{:keys [attrs schema-lookup tx-parallelism init-state] :as argm}]
   (let [{non-ref-attrs :non-ref
          ref-attrs     :ref} (partition-attributes-by-ref
                                (into {}
@@ -833,7 +865,8 @@
             :non-ref-attributes (count non-ref-attrs)
             :ref-attributes (count ref-attrs)
             :ref-percentage (format "%.1f%%" (* 100.0 (/ (count ref-attrs) (count attrs))))
-            :tx-parallelism tx-parallelism)
+            :tx-parallelism tx-parallelism
+            :init-state-entities (count (:old-id->new-id init-state)))
 
         ;; PASS 1: Non-ref attributes
         pass1-start (System/currentTimeMillis)
@@ -842,7 +875,8 @@
                        (assoc argm
                          :attrs (map :db/ident non-ref-attrs)
                          :schema-lookup schema-lookup
-                         :tx-parallelism tx-parallelism))
+                         :tx-parallelism tx-parallelism
+                         :init-state init-state))
         pass1-duration (- (System/currentTimeMillis) pass1-start)
         _ (log/info "=== PASS 1: Complete ==="
             :total-transactions (:tx-count pass1-result)
@@ -853,7 +887,7 @@
                          0)
             :duration-sec (int (/ pass1-duration 1000))
             :final-pending-count (reduce + (map count (vals (:pending-index pass1-result)))))
-        _ (sc.api/spy)
+        ;_ (sc.api/spy)
 
         ;; PASS 2: Ref attributes (always sequential)
         pass2-start (System/currentTimeMillis)
@@ -898,15 +932,16 @@
         _ (log/info "Copying schema (non-composite tuple attributes)"
             :total-attributes (count (::impl/schema-raw schema-lookup))
             :non-composite-tuple-attributes (count non-composite-attrs))
-        _ (copy-schema! {:dest-conn     dest-conn
-                         :attrs         non-composite-attrs
-                         :schema-lookup schema-lookup})
-        _ (log/info "Starting data restore" :tx-parallelism tx-parallelism)
+        {:keys [old-id->new-id]} (copy-schema! {:dest-conn     dest-conn
+                                                :attrs         non-composite-attrs
+                                                :schema-lookup schema-lookup})
+        _ (log/info "Starting data restore" :tx-parallelism tx-parallelism :schema-attr-mappings (count old-id->new-id))
         result (restore-two-pass (assoc argm
                                    :attrs non-composite-attrs
                                    :schema-lookup schema-lookup
-                                   :tx-parallelism tx-parallelism))
-        _ (sc.api/spy)
+                                   :tx-parallelism tx-parallelism
+                                   :init-state {:old-id->new-id old-id->new-id}))
+        ;_ (sc.api/spy)
         _ (log/info "Data restore complete" :result result)
 
         composite-tuple-schema (filter :db/tupleAttrs (::impl/schema-raw schema-lookup))

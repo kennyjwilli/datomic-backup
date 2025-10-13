@@ -242,9 +242,16 @@
                   {:db/ident       :entity/value
                    :db/valueType   :db.type/long
                    :db/cardinality :db.cardinality/one}
+                  {:db/ident       :entity/id-attr
+                   :db/valueType   :db.type/ref
+                   :db/cardinality :db.cardinality/one}
                   {:db/ident       :entity/name+value
                    :db/valueType   :db.type/tuple
                    :db/tupleAttrs  [:entity/name :entity/value]
+                   :db/cardinality :db.cardinality/one}
+                  {:db/ident       :entity/name+id-attr
+                   :db/valueType   :db.type/tuple
+                   :db/tupleAttrs  [:entity/name :entity/id-attr]
                    :db/cardinality :db.cardinality/one}
                   {:db/ident       :entity/coords
                    :db/valueType   :db.type/tuple
@@ -254,11 +261,12 @@
                    :db/valueType   :db.type/tuple
                    :db/tupleType   :db.type/string
                    :db/cardinality :db.cardinality/one}]
-                 [{:entity/id     "e1"
-                   :entity/name   "Test"
-                   :entity/value  42
-                   :entity/coords [10 20]
-                   :entity/labels ["label1" "label2"]}]]
+                 [{:entity/id      "e1"
+                   :entity/name    "Test"
+                   :entity/value   42
+                   :entity/coords  [10 20]
+                   :entity/id-attr :entity/id
+                   :entity/labels  ["label1" "label2"]}]]
     :assertions (fn [ctx]
                   (let [dest-db (d/db (:dest-conn ctx))
                         composite-attr (d/pull dest-db '[:db/ident :db/tupleAttrs] :entity/name+value)
@@ -268,14 +276,18 @@
                     (is (= [:db.type/long :db.type/long] (:db/tupleTypes hetero-attr)))
                     (is (= :db.type/string (:db/tupleType homo-attr))))
                   (let [dest-db (d/db (:dest-conn ctx))
-                        result (d/pull dest-db '[:entity/id :entity/name :entity/value
-                                                 :entity/name+value :entity/coords :entity/labels]
-                                 [:entity/id "e1"])]
-                    (is (= "Test" (:entity/name result)))
-                    (is (= 42 (:entity/value result)))
-                    (is (= ["Test" 42] (:entity/name+value result)))
-                    (is (= [10 20] (:entity/coords result)))
-                    (is (= ["label1" "label2"] (:entity/labels result)))))}])
+                        result (d/pull dest-db '[*] [:entity/id "e1"])]
+                    (is (= {:entity/id           "e1"
+                            :entity/name         "Test"
+                            :entity/value        42
+                            :entity/coords       [10 20]
+                            :entity/labels       ["label1" "label2"]
+                            :entity/name+value   ["Test" 42]
+                            :entity/id-attr      {:db/ident :entity/id}
+                            :entity/name+id-attr ["Test" 73]}
+                          (-> result
+                            (dissoc :db/id)
+                            (update :entity/id-attr dissoc :db/id))))))}])
 
 (deftest tuple-scenarios-current-state-restore
   (doseq [scenario tuple-test-scenarios]
