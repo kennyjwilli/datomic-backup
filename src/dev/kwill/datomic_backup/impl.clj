@@ -334,20 +334,6 @@
              :last-imported-tx last-imported-tx}
       source-eid->dest-eid (assoc :source-eid->dest-eid source-eid->dest-eid))))
 
-(defn clean-schema
-  [schema f]
-  (walk/postwalk
-    (fn [x]
-      (f
-        (if (and (map? x)
-              (let [x' (dissoc x :db/id)]
-                (and
-                  (= 1 (count x'))
-                  (= :db/ident (key (first x'))))))
-          (:db/ident x)
-          x)))
-    schema))
-
 (defn get-old->new-ident-lookup
   [db]
   (let [history-db (d/history db)
@@ -398,15 +384,13 @@
     (fn [lookup {:db/keys [id ident] :as schema}]
       (if (contains? datomic-internal-attrs ident)
         lookup
-        (let [cleaned-schema (clean-schema schema identity)]
-          (-> lookup
-            (update ::schema-raw (fnil conj [])
-              (clean-schema schema (fn [x]
-                                     (if (map? x)
-                                       (dissoc x :db/id)
-                                       x))))
-            (assoc-in [::eid->schema id] cleaned-schema)
-            (assoc-in [::ident->schema ident] cleaned-schema)))))
+        (-> lookup
+          (update ::schema-raw (fnil conj [])
+            (walk/postwalk
+              (fn [x] (if (map? x) (dissoc x :db/id) x))
+              schema))
+          (assoc-in [::eid->schema id] schema)
+          (assoc-in [::ident->schema ident] schema))))
     {} user-schema))
 
 (defn datomic-schema-ident?
