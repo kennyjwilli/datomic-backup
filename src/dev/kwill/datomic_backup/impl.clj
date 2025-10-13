@@ -52,14 +52,10 @@
 
 (defn bootstrap-datoms-stop-tx
   [db]
-  (log/info "bootstrap-datoms-stop-tx: starting datoms query")
   (let [ds (d/datoms db
              {:index      :avet
               :components [:db/txInstant #inst"1970-01-01"]})]
-    (log/info "bootstrap-datoms-stop-tx: datoms query complete, computing max-key")
-    (let [result (:tx (apply max-key :tx ds))]
-      (log/info "bootstrap-datoms-stop-tx: max-key complete" :result result)
-      result)))
+    (:tx (apply max-key :tx ds))))
 
 (defn bootstrap-datoms
   [db]
