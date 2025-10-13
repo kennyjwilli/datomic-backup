@@ -393,9 +393,9 @@
     :db/ensure})
 
 (defn schema-result->lookup
-  [schema-result]
+  [user-schema]
   (reduce
-    (fn [lookup [{:db/keys [id ident] :as schema}]]
+    (fn [lookup {:db/keys [id ident] :as schema}]
       (if (contains? datomic-internal-attrs ident)
         lookup
         (let [cleaned-schema (clean-schema schema identity)]
@@ -407,15 +407,26 @@
                                        x))))
             (assoc-in [::eid->schema id] cleaned-schema)
             (assoc-in [::ident->schema ident] cleaned-schema)))))
-    {} schema-result))
+    {} user-schema))
+
+(defn datomic-schema-ident?
+  [k]
+  ;; https://docs.datomic.com/schema/schema-reference.html#schema-element-restrictions
+  (let [kw-ns (when (qualified-keyword? k) (namespace k))]
+    (boolean (and kw-ns (or (= "db" kw-ns) (str/starts-with? kw-ns "db."))))))
 
 (defn q-schema-lookup
   [db]
-  (let [schema-result (d/q {:query '[:find (pull ?a [*])
+  (let [schema-result (d/q {:query '[:find (pull ?e [*])
                                      :where
-                                     [:db.part/db :db.install/attribute ?a]]
+                                     [?e :db/ident ?i]]
                             :args  [db]
                             :limit -1})
+        user-schema (into []
+                      (comp
+                        (map first)
+                        (remove (comp datomic-schema-ident? :db/ident)))
+                      schema-result)
         old->new-ident-lookup (get-old->new-ident-lookup db)]
-    (assoc (schema-result->lookup schema-result)
+    (assoc (schema-result->lookup user-schema)
       ::old->new-ident-lookup old->new-ident-lookup)))
