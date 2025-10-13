@@ -255,12 +255,18 @@
         (async/>!! dest-ch d)
         (vreset! *start (:v d)))
       (catch ExceptionInfo ex
-        (if (retry/default-retriable? ex)
+        (cond
+          (retry/default-retriable? ex)
           (do
             (read-datoms-to-chan! db (assoc argm ::_start-exclusive @*start) dest-ch)
             (log/warn "Retryable anomaly while reading datoms. Retrying with :start set..."
               :anomaly (ex-data ex)
               :start-exclusive @*start))
+          ;; This will occur occasionally and not sure why... Need to investigate
+          ;; Likely related to :db/ensure & enum idents
+          (= :db.error/attribute-not-indexed (:db/error (ex-data ex)))
+          (log/warn "Skipping not indexed attribute " :attrid (:attrid argm))
+          :else
           (throw ex))))))
 
 (defn read-datoms-in-parallel
@@ -736,12 +742,15 @@
 (defn tempids->old-id-mapping
   "Extracts old-id->new-id mapping from transaction result's :tempids.
   Tempid keys are strings representing old entity IDs."
-  [tempids]
+  [tempids allowed-ks]
   (into {}
-    (keep (fn [[tempid-str new-id]]
-            (when-let [old-id (parse-long tempid-str)]
-              [old-id new-id])))
+    (comp
+      (filter (fn [[tempid-str]] (contains? allowed-ks tempid-str)))
+      (keep (fn [[tempid-str new-id]]
+              (when-let [old-id (parse-long tempid-str)]
+                [old-id new-id]))))
     tempids))
+
 
 (defn copy-schema!
   [{:keys [dest-conn schema-lookup attrs]}]
@@ -781,7 +790,7 @@
                                                       :db/id (str source-eid))))
                                             wave)
                         tx-result (retry/with-retry #(d/transact dest-conn {:tx-data wave-with-tempids}))
-                        wave-mappings (tempids->old-id-mapping (:tempids tx-result))
+                        wave-mappings (tempids->old-id-mapping (:tempids tx-result) (into #{} (map :db/id) wave-with-tempids))
                         updated-mappings (merge old-id->new-id wave-mappings)
                         ;; Now transact the renames
                         rename-txs (mapv (fn [[new-ident old-ident]]
@@ -796,7 +805,7 @@
                                                     (assoc attr :db/id (str source-eid))))
                                             wave)
                         tx-result (retry/with-retry #(d/transact dest-conn {:tx-data wave-with-tempids}))
-                        wave-mappings (tempids->old-id-mapping (:tempids tx-result))]
+                        wave-mappings (tempids->old-id-mapping (:tempids tx-result) (into #{} (map :db/id) wave-with-tempids))]
                     (merge old-id->new-id wave-mappings)))))
             {}
             (map-indexed vector waves))]
