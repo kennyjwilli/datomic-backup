@@ -380,45 +380,42 @@
   Filters out schema and bootstrap datoms.
   Closes all worker channels when input channel closes."
   [datom-ch worker-channels max-batch-size eid->schema max-bootstrap-tx debug]
-  (let [num-workers (count worker-channels)
-        ;; Track current batch for each worker
-        *worker-batches (atom (vec (repeat num-workers [])))
-        *batches-sent (atom 0)]
+  (let [num-workers (count worker-channels)]
     (try
-      (loop []
+      (loop [worker-batches (vec (repeat num-workers []))
+             batches-sent 0]
         (if-let [datom (<anom!! datom-ch)]
           (let [[e _ _ tx] datom]
             ;; Skip bootstrap/schema datoms
             (if (or (contains? eid->schema e) (<= tx max-bootstrap-tx))
-              (recur)
+              (recur worker-batches batches-sent)
               ;; Route to worker based on entity ID hash
               (let [worker-idx (mod (hash e) num-workers)
                     worker-ch (nth worker-channels worker-idx)
-                    current-batch (nth @*worker-batches worker-idx)]
+                    current-batch (nth worker-batches worker-idx)]
                 (if (>= (count current-batch) max-batch-size)
                   ;; Batch is full, send it and start new batch with current datom
                   (do
                     (when debug
                       (log/info "Batcher sending batch"
                         :worker-idx worker-idx
-                        :batches-sent (swap! *batches-sent inc)
+                        :batches-sent (inc batches-sent)
                         :worker-ch-buffer-count (some-> worker-ch .buf .count)))
                     (async/>!! worker-ch current-batch)
-                    (swap! *worker-batches assoc worker-idx [datom])
-                    (recur))
+                    (recur (assoc worker-batches worker-idx [datom])
+                      (inc batches-sent)))
                   ;; Batch has room, add datom
-                  (do
-                    (swap! *worker-batches update worker-idx conj datom)
-                    (recur))))))
+                  (recur (update worker-batches worker-idx conj datom)
+                    batches-sent)))))
           ;; Input channel closed, send final batches and close worker channels
           (doseq [[idx worker-ch] (map-indexed vector worker-channels)]
-            (let [final-batch (nth @*worker-batches idx)]
+            (let [final-batch (nth worker-batches idx)]
               (when (seq final-batch)
                 (when debug
                   (log/info "Batcher sending final batch"
                     :worker-idx idx
                     :final-batch-size (count final-batch)
-                    :total-batches-sent @*batches-sent))
+                    :total-batches-sent batches-sent))
                 (async/>!! worker-ch final-batch)))
             (async/close! worker-ch))))
       (catch Exception e
