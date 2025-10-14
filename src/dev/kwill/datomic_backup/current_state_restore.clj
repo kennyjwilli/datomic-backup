@@ -983,11 +983,12 @@
             :duration-sec (int (/ pass2-duration 1000))
             :final-pending-count (reduce + (map count (vals (:pending-index pass2-result)))))
         total-duration (+ pass1-duration pass2-duration)]
-    {:total-duration-sec (int (/ total-duration 1000))
-     :pass1-duration-sec (int (/ pass1-duration 1000))
-     :pass2-duration-sec (int (/ pass2-duration 1000))
-     :total-transactions (+ (:tx-count pass1-result) (:tx-count pass2-result 0))
-     :total-datoms       (+ (:tx-datom-count pass1-result) (:tx-datom-count pass2-result 0))}))
+    {:stats          {:total-duration-sec (int (/ total-duration 1000))
+                      :pass1-duration-sec (int (/ pass1-duration 1000))
+                      :pass2-duration-sec (int (/ pass2-duration 1000))
+                      :total-transactions (+ (:tx-count pass1-result) (:tx-count pass2-result 0))
+                      :total-datoms       (+ (:tx-datom-count pass1-result) (:tx-datom-count pass2-result 0))}
+     :old-id->new-id (:old-id->new-id pass2-result)}))
 
 (defn restore
   "Restores a database by copying schema and current datom state.
@@ -1015,7 +1016,7 @@
                                    :tx-parallelism tx-parallelism
                                    :init-state {:old-id->new-id old-id->new-id}))
         ;_ (sc.api/spy)
-        _ (log/info "Data restore complete" :result result)
+        _ (log/info "Data restore complete" :result-stats (:stats result))
 
         composite-tuple-schema (filter :db/tupleAttrs (::impl/schema-raw schema-lookup))
         composite-tuple-attrs (map :db/ident composite-tuple-schema)
@@ -1026,4 +1027,4 @@
                            :attrs         composite-tuple-attrs
                            :schema-lookup schema-lookup})
             (add-tuple-attrs! {:dest-conn dest-conn :tuple-schema composite-tuple-schema}))]
-    true))
+    result))
