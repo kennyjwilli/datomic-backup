@@ -249,9 +249,16 @@
         datoms (cond->> (d/index-range db index-range-argm)
                  start-exclusive
                  (drop 1))
-        *start (volatile! nil)]
+        *start (volatile! nil)
+        *counter (volatile! 0)
+        debug (::_debug argm)]
     (try
       (doseq [d datoms]
+        (when (and debug (zero? (mod (vswap! *counter inc) 10000)))
+          (log/info "Reader progress"
+            :attrid (:attrid argm)
+            :datoms-sent @*counter
+            :datom-ch-buffer-count (some-> dest-ch .buf .count)))
         (async/>!! dest-ch d)
         (vreset! *start (:v d)))
       (catch ExceptionInfo ex
@@ -270,25 +277,26 @@
           (throw ex))))))
 
 (defn read-datoms-in-parallel
-  [source-db {:keys [attrs dest-ch parallelism read-chunk]}]
+  [source-db {:keys [attrs dest-ch parallelism read-chunk debug]}]
   (let [exec (Executors/newFixedThreadPool parallelism)
         done-ch (async/chan)
         start-time (System/currentTimeMillis)]
     (doseq [a attrs]
       (.submit exec ^Runnable
         (fn []
-          (log/debug "Start reading datoms..." :attrid a)
+          (log/info "Start reading datoms..." :attrid a)
           (try
             (read-datoms-to-chan! source-db
-              {:attrid a
-               :chunk  read-chunk
-               :limit  -1}
+              {:attrid  a
+               :chunk   read-chunk
+               :limit   -1
+               ::_debug debug}
               dest-ch)
             (catch Exception ex (async/>!! dest-ch ex)))
           (async/>!! done-ch a))))
     (async/go-loop [n 0]
       (let [attr (async/<! done-ch)]
-        (log/debug "Done reading attr." :attrid attr))
+        (log/info "Done reading attr." :attrid attr))
       (if (< (inc n) (count attrs))
         (recur (inc n))
         (let [duration (- (System/currentTimeMillis) start-time)]
@@ -362,10 +370,11 @@
   This prevents entity splitting when max-batch-size is smaller than an entity's datom count.
   Filters out schema and bootstrap datoms.
   Closes all worker channels when input channel closes."
-  [datom-ch worker-channels max-batch-size eid->schema max-bootstrap-tx]
+  [datom-ch worker-channels max-batch-size eid->schema max-bootstrap-tx debug]
   (let [num-workers (count worker-channels)
         ;; Track current batch for each worker
-        *worker-batches (atom (vec (repeat num-workers [])))]
+        *worker-batches (atom (vec (repeat num-workers [])))
+        *batches-sent (atom 0)]
     (try
       (loop []
         (if-let [datom (<anom!! datom-ch)]
@@ -380,6 +389,11 @@
                 (if (>= (count current-batch) max-batch-size)
                   ;; Batch is full, send it and start new batch with current datom
                   (do
+                    (when debug
+                      (log/info "Batcher sending batch"
+                        :worker-idx worker-idx
+                        :batches-sent (swap! *batches-sent inc)
+                        :worker-ch-buffer-count (some-> worker-ch .buf .count)))
                     (async/>!! worker-ch current-batch)
                     (swap! *worker-batches assoc worker-idx [datom])
                     (recur))
@@ -391,6 +405,11 @@
           (doseq [[idx worker-ch] (map-indexed vector worker-channels)]
             (let [final-batch (nth @*worker-batches idx)]
               (when (seq final-batch)
+                (when debug
+                  (log/info "Batcher sending final batch"
+                    :worker-idx idx
+                    :final-batch-size (count final-batch)
+                    :total-batches-sent @*batches-sent))
                 (async/>!! worker-ch final-batch)))
             (async/close! worker-ch))))
       (catch Exception e
@@ -430,7 +449,7 @@
                            next-old-id->new-id (merge old-id->new-id batch-old-id->new-id)]
 
                        (when debug
-                         (log/debug "Worker completed batch"
+                         (log/info "Worker completed batch"
                            :worker-id worker-id
                            :batch-size (count batch)
                            :tx-data-size (count tx-data)
@@ -452,6 +471,10 @@
                         :error   ex}))]
         (if (:success result)
           (do
+            (when debug
+              (log/info "Worker sending result to result-ch"
+                :worker-id worker-id
+                :result-ch-buffer-count (some-> result-ch .buf .count)))
             (async/>!! result-ch (:result result))
             (recur (:next-state result)))
           (do
@@ -463,7 +486,7 @@
 
 (defn collect-results!
   "Collects results from workers and merges them into final state.
-  Logs progress every 10 transactions when debug is enabled.
+  Logs progress every 5 transactions when debug is enabled.
   Returns when result-ch is closed."
   [result-ch debug init-state]
   (loop [acc (merge {:old-id->new-id    {}
@@ -483,10 +506,10 @@
                          (update :tx-datom-count + (:tx-datom-count result))
                          (update :total-tx-time-ms + (:tx-time-ms result))
                          (update :input-datom-count + (:batch-size result)))]
-          (when (and debug (zero? (mod (:tx-count next-acc) 10)))
-            (log/info "Parallel batch progress"
+          (when (and debug (zero? (mod (:tx-count next-acc) 5)))
+            (log/info "Collector draining results"
               :tx-count (:tx-count next-acc)
-              :tx-datom-count (:tx-datom-count next-acc)
+              :result-ch-buffer-count (some-> result-ch .buf .count)
               :entities-created (count (:old-id->new-id next-acc))
               :avg-tx-ms (int (/ (:total-tx-time-ms next-acc) (:tx-count next-acc)))))
           (recur next-acc)))
@@ -542,12 +565,13 @@
             {:attrs       attrs
              :parallelism read-parallelism
              :dest-ch     datom-ch
-             :read-chunk  read-chunk})
+             :read-chunk  read-chunk
+             :debug       debug})
 
         ;; Start batcher thread with entity-partitioned routing
         batcher-thread (async/thread
                          (batch-datoms-partitioned! datom-ch worker-channels
-                           max-batch-size schema-ids max-bootstrap-tx))
+                           max-batch-size schema-ids max-bootstrap-tx debug))
 
         ;; Start worker threads, each with its own channel
         worker-threads (into []
@@ -750,7 +774,6 @@
               (when-let [old-id (parse-long tempid-str)]
                 [old-id new-id]))))
     tempids))
-
 
 (defn copy-schema!
   [{:keys [dest-conn schema-lookup attrs]}]
