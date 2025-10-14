@@ -66,7 +66,16 @@
     [dev.kwill.datomic-backup.retry :as retry]
     [sc.api])
   (:import (clojure.lang ExceptionInfo)
-           (java.util.concurrent Executors)))
+           (java.util.concurrent Executors TimeUnit ThreadFactory)))
+
+(defn thread-factory
+  "Creates a ThreadFactory that names threads with the given prefix and an incrementing counter."
+  [name-prefix]
+  (let [counter (atom 0)]
+    (reify ThreadFactory
+      (newThread [_ runnable]
+        (doto (Thread. runnable)
+          (.setName (str name-prefix "-" (swap! counter inc))))))))
 
 (defn resolve-datom
   [datom eid->schema old-id->new-id]
@@ -278,7 +287,7 @@
 
 (defn read-datoms-in-parallel
   [source-db {:keys [attrs dest-ch parallelism read-chunk debug]}]
-  (let [exec (Executors/newFixedThreadPool parallelism)
+  (let [exec (Executors/newFixedThreadPool parallelism (thread-factory "datom-reader"))
         done-ch (async/chan)
         start-time (System/currentTimeMillis)]
     (doseq [a attrs]
@@ -560,7 +569,12 @@
                                #(async/chan (* 2 tx-parallelism))))
         result-ch (async/chan 100)
 
-        ;; Start datom reader
+        ;; Create separate ExecutorServices for each role
+        batcher-exec (Executors/newSingleThreadExecutor (thread-factory "datom-batcher"))
+        worker-exec (Executors/newFixedThreadPool tx-parallelism (thread-factory "tx-worker"))
+        collector-exec (Executors/newSingleThreadExecutor (thread-factory "result-collector"))
+
+        ;; Start datom reader (has its own executor)
         _ (read-datoms-in-parallel source-db
             {:attrs       attrs
              :parallelism read-parallelism
@@ -568,50 +582,70 @@
              :read-chunk  read-chunk
              :debug       debug})
 
-        ;; Start batcher thread with entity-partitioned routing
-        batcher-thread (async/thread
-                         (batch-datoms-partitioned! datom-ch worker-channels
-                           max-batch-size schema-ids max-bootstrap-tx debug))
+        ;; Start batcher with entity-partitioned routing
+        batcher-future (.submit batcher-exec ^Runnable
+                         (fn []
+                           (batch-datoms-partitioned! datom-ch worker-channels
+                             max-batch-size schema-ids max-bootstrap-tx debug)))
 
         ;; Start worker threads, each with its own channel
-        worker-threads (into []
+        worker-futures (into []
                          (map-indexed
                            (fn [idx worker-ch]
-                             (async/thread
-                               (tx-worker! worker-ch result-ch dest-conn
-                                 eid->schema debug (str "worker-" idx)))))
+                             (.submit worker-exec ^Runnable
+                               (fn []
+                                 (tx-worker! worker-ch result-ch dest-conn
+                                   eid->schema debug (str "worker-" idx))))))
                          worker-channels)
 
-        ;; Start result collector in a thread with init-state
-        collector-thread (async/thread (collect-results! result-ch debug init-state))]
+        ;; Start result collector with init-state
+        collector-future (.submit collector-exec ^Callable
+                           (fn [] (collect-results! result-ch debug init-state)))]
 
-    ;; Wait for batcher to finish (closes all worker channels)
-    (async/<!! batcher-thread)
+    (try
+      ;; Wait for batcher to finish (closes all worker channels)
+      (.get batcher-future)
 
-    ;; Wait for all workers to finish (they exit when their channel closes)
-    (doseq [worker-thread worker-threads]
-      (async/<!! worker-thread))
+      ;; Wait for all workers to finish (they exit when their channel closes)
+      (doseq [worker-future worker-futures]
+        (.get worker-future))
 
-    ;; Close result-ch so collector finishes
-    (async/close! result-ch)
+      ;; Close result-ch so collector finishes
+      (async/close! result-ch)
 
-    ;; Get final results from collector
-    (let [final-state (async/<!! collector-thread)]
-      (log/info "Pass 1 parallel copy complete"
-        :total-transactions (:tx-count final-state)
-        :total-datoms (:tx-datom-count final-state)
-        :entities-created (count (:old-id->new-id final-state))
-        :avg-tx-ms (if (pos? (:tx-count final-state))
-                     (int (/ (:total-tx-time-ms final-state) (:tx-count final-state)))
-                     0))
+      ;; Get final results from collector
+      (let [final-state (.get collector-future)]
+        (log/info "Pass 1 parallel copy complete"
+          :total-transactions (:tx-count final-state)
+          :total-datoms (:tx-datom-count final-state)
+          :entities-created (count (:old-id->new-id final-state))
+          :avg-tx-ms (if (pos? (:tx-count final-state))
+                       (int (/ (:total-tx-time-ms final-state) (:tx-count final-state)))
+                       0))
 
-      ;; Return state in same format as -full-copy
-      (assoc final-state
-        :tx-eids #{}
-        :pending-index {}
-        :dest-conn dest-conn
-        :eid->schema eid->schema
-        :debug debug))))
+        ;; Return state in same format as -full-copy
+        (assoc final-state
+          :tx-eids #{}
+          :pending-index {}
+          :dest-conn dest-conn
+          :eid->schema eid->schema
+          :debug debug))
+      (finally
+        ;; Shutdown all executors and wait for termination
+        (.shutdown batcher-exec)
+        (.shutdown worker-exec)
+        (.shutdown collector-exec)
+        (when-not (.awaitTermination batcher-exec 30 TimeUnit/SECONDS)
+          (log/warn "Batcher executor did not terminate within timeout, forcing shutdown")
+          (.shutdownNow batcher-exec))
+        (when-not (.awaitTermination worker-exec 60 TimeUnit/SECONDS)
+          (log/warn "Worker executor did not terminate within timeout, forcing shutdown")
+          (.shutdownNow worker-exec))
+        (when-not (.awaitTermination collector-exec 30 TimeUnit/SECONDS)
+          (log/warn "Collector executor did not terminate within timeout, forcing shutdown")
+          (.shutdownNow collector-exec))))))
+
+(comment (sc.api/defsc 1))
 
 (defn -full-copy
   [{:keys [source-db
