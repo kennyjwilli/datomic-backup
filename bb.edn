@@ -12,6 +12,25 @@
                    (println "Error: Working tree is not clean. Commit or stash changes before releasing.")
                    (System/exit 1))
                  (println "Working tree is clean.")))}
+
+  update-readme-version
+  {:doc      "Update the version in README.md"
+   :requires ([clojure.string :as str])
+   :task     (do
+               (require '[clojure.string :as str])
+
+               (let [version (-> (shell {:out :string} "clojure -T:build print-version") :out str/trim)
+                     readme-path "README.md"]
+
+                 (when (str/blank? version)
+                   (println "Error: Could not determine version from build.clj")
+                   (System/exit 1))
+
+                 (println (str "Updating README.md version to " version))
+                 (shell (format "sed -i '' 's/:mvn\\/version \"[^\"]*\"/:mvn\\/version \"%s\"/' %s"
+                          version readme-path))
+                 (println "README.md version updated.")))}
+
   tag
   {:doc      "Create and push a git tag for the current version"
    :requires ([clojure.string :as str])
@@ -38,7 +57,7 @@
   release
   {:doc  "Build jar, deploy to Clojars, and create git tag"
    :task (do
-           (println "Building jar...")
+           (println "\nBuilding jar...")
            (shell "clojure -T:build jar")
 
            (println "\nDeploying to Clojars...")
@@ -46,5 +65,8 @@
 
            (println "\nCreating and pushing git tag...")
            (shell "bb tag")
+
+           (println "Updating README version...")
+           (shell "bb update-readme-version")
 
            (println "\nRelease complete!"))}}}
