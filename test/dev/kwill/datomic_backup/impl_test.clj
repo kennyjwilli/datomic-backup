@@ -9,21 +9,6 @@
   [db attr]
   (:db/id (d/pull db [:db/id] attr)))
 
-(deftest asd
-  (with-open [ctx (testh/test-ctx {})]
-    (testh/test-data! (:source-conn ctx))
-    (is (= 4
-           (count
-            (vec
-             (impl/transactions-from-source
-              (:source-conn ctx)
-              {:transform-datoms
-               (fn [ds]
-                 (if (impl/tx-contains-only-tx-datoms?
-                      (attr-id (d/db (:source-conn ctx)) :db/txInstant) ds)
-                   []
-                   ds))})))))))
-
 (deftest filter-map->fn-test
   (with-open [ctx (testh/test-ctx {})]
     (testh/test-data! (:source-conn ctx) {:start-date #inst"2020"})
