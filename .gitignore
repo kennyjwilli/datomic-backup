@@ -8,3 +8,4 @@ log
 dev/local
 .mcp.json
 *.local*
+target
