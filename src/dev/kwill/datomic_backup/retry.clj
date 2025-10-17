@@ -22,8 +22,8 @@
             max-jitter-ms
             rand-int]
      :or   {base          100
-            max-backoff   10000
-            max-retries   5
+            max-backoff   20000
+            max-retries   64
             max-jitter-ms 100
             rand-int      rand-int}}]
    (let [backoff-fn (capped-exponential-backoff
@@ -44,7 +44,8 @@
   (or
     (contains? #{:cognitect.anomalies/busy
                  :cognitect.anomalies/unavailable
-                 :cognitect.anomalies/interrupted}
+                 :cognitect.anomalies/interrupted
+                 :cognitect.anomalies/fault}
       (:cognitect.anomalies/category x))
     (and (instance? ExceptionInfo x)
       (default-retriable? (ex-data x)))))
