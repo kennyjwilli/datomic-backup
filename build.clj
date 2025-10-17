@@ -23,6 +23,8 @@
     [:developerConnection "scm:git:ssh:git@github.com:kennyjwilli/datomic-backup.git"]
     [:tag (str "v" version)]]])
 
+(defn print-version [_] (println version))
+
 (defn jar-opts
   [opts]
   (assoc opts

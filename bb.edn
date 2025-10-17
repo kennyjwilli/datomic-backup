@@ -1,0 +1,50 @@
+{:tasks
+ {check-clean
+  {:doc      "Check that the git working tree is clean"
+   :requires ([clojure.string :as str])
+   :task     (do
+               (require '[clojure.string :as str])
+
+               (let [status (-> (shell {:out :string} "git status --porcelain")
+                              :out
+                              str/trim)]
+                 (when-not (str/blank? status)
+                   (println "Error: Working tree is not clean. Commit or stash changes before releasing.")
+                   (System/exit 1))
+                 (println "Working tree is clean.")))}
+  tag
+  {:doc      "Create and push a git tag for the current version"
+   :requires ([clojure.string :as str])
+   :task     (do
+               (require '[clojure.string :as str])
+
+               ;; Check for clean working tree
+               (shell "bb check-clean")
+
+               ;; Get version from build.clj
+               (let [version (-> (shell {:out :string} "clojure -T:build print-version") :out str/trim)
+                     tag (str "v" version)]
+
+                 (when (str/blank? version)
+                   (println "Error: Could not determine version from build.clj")
+                   (System/exit 1))
+
+                 (println (str "Creating tag: " tag))
+                 (shell "git tag" tag)
+                 (println (str "Pushing tag: " tag))
+                 (shell "git push origin" tag)
+                 (println (str "Successfully tagged and pushed " tag))))}
+
+  release
+  {:doc  "Build jar, deploy to Clojars, and create git tag"
+   :task (do
+           (println "Building jar...")
+           (shell "clojure -T:build jar")
+
+           (println "\nDeploying to Clojars...")
+           (shell "clojure -T:build deploy")
+
+           (println "\nCreating and pushing git tag...")
+           (shell "bb tag")
+
+           (println "\nRelease complete!"))}}}
