@@ -1026,4 +1026,4 @@
                            :attrs         composite-tuple-attrs
                            :schema-lookup schema-lookup})
             (add-tuple-attrs! {:dest-conn dest-conn :tuple-schema composite-tuple-schema}))]
-    result))
+    (assoc result :as-of-t (:t source-db))))
