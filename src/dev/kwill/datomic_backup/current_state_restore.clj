@@ -63,8 +63,7 @@
     [clojure.tools.logging :as log]
     [datomic.client.api :as d]
     [dev.kwill.datomic-backup.impl :as impl]
-    [dev.kwill.datomic-backup.retry :as retry]
-    [sc.api])
+    [dev.kwill.datomic-backup.retry :as retry])
   (:import (clojure.lang ExceptionInfo)
            (java.util.concurrent Executors TimeUnit ThreadFactory)))
 
@@ -207,7 +206,7 @@
                       tx-data]} (try
                                   (retry/with-retry #(d/transact dest-conn {:tx-data tx-data}))
                                   (catch Exception ex
-                                    (sc.api/spy)
+                                    ;(sc.api/spy)
                                     (throw ex)))
               tx-duration (- (System/currentTimeMillis) tx-start)
               next-old-id->new-id (into old-id->new-id
@@ -471,7 +470,7 @@
                                      :batch-size     (count batch)}
                         :next-state next-old-id->new-id})
                      (catch Exception ex
-                       (sc.api/spy)
+                       ;(sc.api/spy)
                        (log/error ex "Worker failed to process batch" :worker-id worker-id)
                        {:success false
                         :error   ex}))]
