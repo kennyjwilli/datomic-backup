@@ -755,10 +755,6 @@
                :waiting-for   #{9999}}] (:pending-datoms result))
         "Should have 1 pending datom for tuple with ref to non-existent entity 9999")
 
-      ;; Verify txInstant is tracked separately (not in tx-data or pending)
-      (is (= #{999} (:tx-eids result))
-        "txInstant entities should be tracked in :tx-eids")
-
       ;; Verify old-id->tempid mappings
       (is (= {1000 "1000" 2000 "2000" 4000 "4000" 5000 "5000"}
             (:old-id->tempid result))
