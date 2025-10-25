@@ -983,7 +983,7 @@
                       :pass2-duration-sec (int (/ pass2-duration 1000))
                       :total-transactions (+ (:tx-count pass1-result) (:tx-count pass2-result 0))
                       :total-datoms       (+ (:tx-datom-count pass1-result) (:tx-datom-count pass2-result 0))}
-     :old-id->new-id (:old-id->new-id pass2-result)}))
+     :old-id->new-id (or (:old-id->new-id pass2-result) (:old-id->new-id pass1-result))}))
 
 (defn restore
   "Restores a database by copying schema and current datom state.

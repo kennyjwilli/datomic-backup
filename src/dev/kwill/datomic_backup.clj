@@ -4,56 +4,53 @@
     [clojure.tools.logging :as log]
     [datomic.client.api :as d]
     [dev.kwill.datomic-backup.current-state-restore :as cs-restore]
-    [dev.kwill.datomic-backup.impl :as impl])
+    [dev.kwill.datomic-backup.impl :as impl]
+    [dev.kwill.datomic-backup.restore-state :as rs])
   (:import (java.io Closeable)))
 
 (defn restore-db
-  [{:keys [source dest-conn stop init-state with? transact progress]
+  [{:keys [source dest-conn stop init-state with? transact progress transform-datoms]
     :or   {transact d/transact}}]
-  (let [max-tx-id (when progress (impl/max-tx-id-from-source source))
+  (let [max-t (when progress (impl/max-tx-id-from-source source))
         source (if (impl/conn? source) source (io/reader (io/file source)))
-        init-state (assoc init-state :tx-count 0)
-        _ (log/info "restore-db: calling transactions-from-source")
+        init-db ((if with? d/with-db d/db) dest-conn)
+        ;; While most often the Datomic internal DB eids are the same, we should not make that assumption.
+        ;; Since we are replaying transactions that may include schema entities (e.g., :db/ident), we must
+        ;; know how Datomic internal eids map between source and dest.
+        internal-source-eid->dest-eid (impl/q-datomic-internal-source-eid->dest-eid (d/db source) (d/db dest-conn))
+        init-state (assoc init-state
+                     :tx-count 0
+                     :db-before init-db
+                     :source-eid->dest-eid (merge (:source-eid->dest-eid init-state) internal-source-eid->dest-eid))
+        start-t (some-> (:last-imported-t init-state) inc)
         transactions (impl/transactions-from-source source
                        (cond-> {}
-                         (:last-imported-tx init-state)
-                         (assoc :start (inc (:last-imported-tx init-state)))
-                         stop (assoc :stop stop)))
-        _ (log/info "restore-db: got transactions sequence, getting init-db")
-        init-db ((if with? d/with-db d/db) dest-conn)]
+                         start-t (assoc :start start-t)
+                         stop (assoc :stop stop)
+                         transform-datoms (assoc :transform-datoms transform-datoms)))]
     (log/info "Starting restore"
       :source (if (impl/conn? source) "conn" "file")
-      :resuming-from-tx (:last-imported-tx init-state)
-      :max-tx max-tx-id)
-    (log/info "restore-db: starting reduce over transactions")
+      :start-t start-t
+      :max-tx max-t)
     (try
       (let [result (reduce
                      (fn [state datoms]
+                       (println datoms)
                        (log/info "reduce fn: received datoms batch" :count (count datoms) :first-tx (:tx (first datoms)))
-                       (let [new-state (cond-> (impl/next-datoms-state state
-                                                 datoms
-                                                 (if with?
-                                                   #(d/with (:db-before state) %)
-                                                   #(transact dest-conn %)))
-                                         progress
-                                         (impl/next-progress-report progress (:tx (first datoms)) max-tx-id))
+                       (let [tx! (if with? #(d/with (:db-before state) %) #(transact dest-conn %))
+                             new-state (impl/next-datoms-state state datoms tx!)
                              tx-count (:tx-count new-state)]
-                         (log/info "reduce fn: next-datoms-state returned" :new-tx-count tx-count)
                          (when (zero? (mod tx-count 100))
                            (log/info "Processed transactions"
                              :tx-count tx-count
-                             :last-imported-tx (:last-imported-tx new-state)
-                             :max-tx max-tx-id
-                             :percent (when max-tx-id (format "%.1f%%" (* 100.0 (/ (:last-imported-tx new-state) max-tx-id))))))
+                             :last-imported-t (:last-imported-t new-state)
+                             :max-tx max-t
+                             :percent (when max-t (format "%.1f%%" (* 100.0 (/ (:last-imported-t new-state) max-t))))))
                          new-state))
-                     (assoc init-state
-                       :db-before init-db
-                       :source-eid->dest-eid (or
-                                               (:source-eid->dest-eid init-state)
-                                               (impl/initial-eid-mapping init-db)))
-                     transactions)]
-        (log/info "Restore complete" :tx-count (:tx-count result))
-        result)
+                     init-state transactions)
+            _ (log/info "Restore complete" :tx-count (:tx-count result))
+            source-eid->dest-eid (apply dissoc (:source-eid->dest-eid result) (keys internal-source-eid->dest-eid))]
+        (assoc result :source-eid->dest-eid source-eid->dest-eid))
       (finally
         (when (instance? Closeable source) (.close source))))))
 
@@ -215,3 +212,133 @@
   (d/pull (d/db conn)
     '[*]
     87960930222593))
+
+(defn incremental-restore
+  "Performs incremental, resumable restore with automatic catch-up.
+
+  First call: Executes current-state-restore and stores state.
+  Subsequent calls: Automatically performs transaction replay catch-up.
+
+  Required options:
+  - :source-conn - Source database connection
+  - :dest-conn - Destination database connection
+  - :state-conn - State database connection for tracking restore progress
+
+  Optional options:
+  - All current-state-restore options (max-batch-size, read-parallelism, etc.)
+  - :eid-mapping-batch-size - Number of EID mappings per state transaction (default 1,000)
+
+  Returns:
+  {:status :initial | :incremental
+   :as-of-t <basis-t>
+   :session-id <uuid>
+   :transactions-replayed <n> (only for :incremental, 0 if already up-to-date)
+   :old-id->new-id <mappings>  (for :initial)
+   :stats <stats>              (for :initial)}"
+  [{:keys [source-conn dest-conn state-conn eid-mapping-batch-size]
+    :or   {eid-mapping-batch-size 1000}
+    :as   opts}]
+  (let [;; Ensure state schema exists
+        _ (rs/ensure-schema! state-conn)
+        source-db (d/db source-conn)
+        dest-db (d/db dest-conn)
+        _ (log/info "Starting incremental restore" {:source (:db-name source-db) :dest (:db-name dest-db)})
+
+        ;; Find or create session
+        {:kwill.datomic-backup.session/keys [last-restored-t]
+         session-id                         :kwill.datomic-backup.session/id}
+        (rs/find-or-create-session! state-conn (:db-name source-db) (:db-name dest-db))]
+
+    (if-not last-restored-t
+      ;; INITIAL RESTORE: No prior restore exists
+      (let [_ (log/info "No prior restore found, performing initial current-state restore" {:session-id session-id})
+            restore-opts (-> opts
+                           (dissoc :state-conn :batch-size)
+                           (assoc :source-db source-db :dest-conn dest-conn))
+            result (current-state-restore restore-opts)
+            {:keys [old-id->new-id as-of-t stats]} result]
+
+        (log/info "Initial restore complete, storing state"
+          {:session-id    session-id
+           :as-of-t       as-of-t
+           :mapping-count (count old-id->new-id)})
+
+        ;; Store all mappings and update session
+        (rs/update-restore-state! state-conn
+          {:session-id      session-id
+           :new-mappings    old-id->new-id
+           :last-restored-t as-of-t
+           :batch-size      eid-mapping-batch-size})
+
+        (log/info "State stored successfully")
+
+        ;; Return result
+        (assoc result
+          :stats stats
+          :session-id session-id))
+
+      ;; INCREMENTAL RESTORE: Prior restore exists, perform catch-up
+      (let [current-t (:t source-db)]
+        ;; Validate that source hasn't been reset
+        (when (< current-t last-restored-t)
+          (throw (ex-info "Source database appears to have been reset (current basis-t is lower than last-restored-t)"
+                   {:current-t       current-t
+                    :last-restored-t last-restored-t
+                    :session-id      session-id})))
+
+        (if (= current-t last-restored-t)
+          ;; Already up-to-date
+          (do
+            (log/info "Already up-to-date, no new transactions to replay" {:session-id session-id :current-t current-t})
+            {:status                :incremental
+             :session-id            session-id
+             :as-of-t               current-t
+             :transactions-replayed 0})
+
+          ;; Perform incremental catch-up
+          (do
+            (log/info "Performing incremental restore"
+              {:session-id       session-id
+               :last-restored-t  last-restored-t
+               :current-t        current-t
+               :transactions-gap (- current-t last-restored-t)})
+
+            ;; Load existing mappings
+            (let [existing-mappings (rs/load-eid-mappings (d/db state-conn) session-id)
+                  _ (log/info "Loaded existing EID mappings" {:count (count existing-mappings)})
+
+                  ;; Perform incremental restore using restore-db
+                  init-state {:last-imported-tx     last-restored-t
+                              :source-eid->dest-eid existing-mappings}
+                  result (restore-db {:source source-conn
+                                      :dest-conn dest-conn
+                                      :init-state init-state
+                                      :transform-datoms (fn [datoms]
+                                                          ;; TODO: support transaction entities
+                                                          ;; removed for now due to :db.error/past-tx-instant
+                                                          (remove (fn [d] (= (:e d) (:tx d))) datoms))})
+                  {:keys [tx-count source-eid->dest-eid last-imported-t]} result
+
+                  ;; Filter to only new mappings
+                  new-mappings (apply dissoc source-eid->dest-eid (keys existing-mappings))]
+
+              (log/info "Incremental restore complete"
+                {:session-id            session-id
+                 :transactions-replayed tx-count
+                 :new-mappings          (count new-mappings)
+                 :last-imported-t       last-imported-t})
+
+              ;; Store new mappings and update session
+              (rs/update-restore-state! state-conn
+                {:session-id      session-id
+                 :new-mappings    new-mappings
+                 :last-restored-t last-imported-t
+                 :batch-size      eid-mapping-batch-size})
+
+              (log/info "State updated successfully")
+
+              ;; Return result
+              {:status                :incremental
+               :session-id            session-id
+               :as-of-t               last-imported-t
+               :transactions-replayed tx-count})))))))
