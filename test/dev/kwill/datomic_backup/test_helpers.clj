@@ -103,7 +103,7 @@
 
   Options:
   - :with-state? - If true, creates a state-conn for incremental restore testing (default false)"
-  [{:keys [dbs] :or [:source-conn :dest-conn]}]
+  [{:keys [dbs] :or {dbs [:source-conn :dest-conn]}}]
   (let [client (d/client
                  {:server-type :datomic-local
                   :storage-dir :mem
@@ -114,8 +114,7 @@
         conn! (fn [db-name]
                 (d/create-database client {:db-name db-name})
                 (d/connect client {:db-name db-name}))
-        ctx (into {:closef cleanupf
-                   :client client}
+        ctx (into {:closef cleanupf :client client}
               (map (fn [k] {k (conn! (name k))}))
               dbs)]
     (map->TestCtx ctx)))
