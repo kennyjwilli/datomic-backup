@@ -98,8 +98,8 @@
     :db/cardinality :db.cardinality/one
     :db/doc         "Variable-length tuple of keyword tags"}])
 
-(defn test-ctx
-  [{}]
+(defn test-ctx*
+  [{:keys [dbs]}]
   (let [client (d/client
                  {:server-type :datomic-local
                   :storage-dir :mem
@@ -110,13 +110,19 @@
         conn! (fn [db-name]
                 (d/create-database client {:db-name db-name})
                 (d/connect client {:db-name db-name}))
-        source-conn (conn! "source")
-        dest-conn (conn! "dest")]
-    (map->TestCtx
-      {:closef      cleanupf
-       :client      client
-       :source-conn source-conn
-       :dest-conn   dest-conn})))
+        ctx (into {:closef cleanupf
+                   :client client}
+              (map (fn [k] {k (conn! (name k))}))
+              dbs)]
+    (map->TestCtx ctx)))
+
+(defn test-ctx
+  "Create a test context with source, dest, and optionally state connections.
+
+  Options:
+  - :with-state? - If true, creates a state-conn for incremental restore testing (default false)"
+  [{:keys [with-state?] :or {with-state? false}}]
+  (test-ctx* {:dbs (cond-> [:source-conn :dest-conn] with-state? (conj :state-conn))}))
 
 (defn tx-date
   [date]
