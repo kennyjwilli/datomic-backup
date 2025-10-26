@@ -12,6 +12,7 @@
   [{:keys [source dest-conn stop init-state with? transact progress transform-datoms]
     :or   {transact d/transact}}]
   (let [max-t (when progress (impl/max-tx-id-from-source source))
+        ;; source must be a conn since d/tx-range requires it
         source (if (impl/conn? source) source (io/reader (io/file source)))
         init-db ((if with? d/with-db d/db) dest-conn)
         ;; While most often the Datomic internal DB eids are the same, we should not make that assumption.
@@ -309,9 +310,9 @@
                   ;; Perform incremental restore using restore-db
                   init-state {:last-imported-tx     last-restored-t
                               :source-eid->dest-eid existing-mappings}
-                  result (restore-db {:source source-conn
-                                      :dest-conn dest-conn
-                                      :init-state init-state
+                  result (restore-db {:source           source-conn
+                                      :dest-conn        dest-conn
+                                      :init-state       init-state
                                       :transform-datoms (fn [datoms]
                                                           ;; TODO: support transaction entities
                                                           ;; removed for now due to :db.error/past-tx-instant
