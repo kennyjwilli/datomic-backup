@@ -277,10 +277,24 @@
       (cond-> (assoc state :total-expected-txes total-txes)
         report? (assoc :last-reported-percent perc-done)))))
 
+(defn q-last-tx
+  [db]
+  (ffirst (d/q '[:find (max ?tx) :where [?tx :db/txInstant]] db)))
+
+(defn tx->t
+  [conn tx]
+  (let [{:keys [t]} (first (d/tx-range conn {:start tx :end (inc tx)}))]
+    t))
+
+(defn t->tx
+  [conn t]
+  (let [{:keys [data]} (first (d/tx-range conn {:start t :end (inc t)}))]
+    (:tx (first data))))
+
 (defn max-tx-id-from-source
   [source]
   (if (conn? source)
-    (:t (d/db source))
+    (q-last-tx (d/db source))
     (last-backed-up-tx-id source)))
 
 (defn write-state-file!
@@ -404,17 +418,3 @@
                           {:ident ident :source-eid source-eid})))
                [source-eid dest-eid])))
       source-ident->eid)))
-
-(defn q-last-tx
-  [db]
-  (ffirst (d/q '[:find (max ?tx) :where [?tx :db/txInstant]] db)))
-
-(defn tx->t
-  [conn tx]
-  (let [{:keys [t]} (first (d/tx-range conn {:start tx :end (inc tx)}))]
-    t))
-
-(defn t->tx
-  [conn t]
-  (let [{:keys [data]} (first (d/tx-range conn {:start t :end (inc t)}))]
-    (:tx (first data))))
