@@ -161,7 +161,7 @@
   - :debug - Enable debug logging (default false)
   - :tx-parallelism - parallelism for transaction worker (default 4)"
   [{:keys [source-db dest-conn max-batch-size read-parallelism read-chunk debug tx-parallelism]
-    :or   {max-batch-size   500
+    :or   {max-batch-size   2000
            read-parallelism 20
            read-chunk       5000
            tx-parallelism   4}}]
