@@ -252,14 +252,15 @@
         index-range-argm (cond-> argm
                            start-exclusive
                            (assoc :start start-exclusive))
-        datoms (cond->> (d/index-range db index-range-argm)
-                 start-exclusive
-                 (drop 1))
         *start (volatile! nil)
         *counter (volatile! 0)
         debug (::_debug argm)]
     (try
-      (doseq [d datoms]
+      (doseq [;; datomic-local has differing behavior where d/index-range may throw at all-site an
+              ;; attribute-not-indexed error, so we must wrap in the try/catch.
+              d (cond->> (d/index-range db index-range-argm)
+                  start-exclusive
+                  (drop 1))]
         (when (and debug (zero? (mod (vswap! *counter inc) 10000)))
           (log/info "Reader progress"
             :attrid (:attrid argm)
