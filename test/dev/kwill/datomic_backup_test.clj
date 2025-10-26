@@ -299,18 +299,18 @@
                                          :dest-conn (:dest-conn ctx)}))
         (:assertions scenario)))))
 
-;(deftest tuple-scenarios-restore-db
-;  (doseq [scenario tuple-test-scenarios
-;          :when (not (#{"Composite tuples added after data"
-;                        "Composite tuples with renamed component attributes"}
-;                      (:name scenario)))]
-;    (with-open [ctx (testh/test-ctx {})]
-;      (run-restore-test ctx
-;        (:schema scenario)
-;        (fn [ctx]
-;          (backup/restore-db {:source    (:source-conn ctx)
-;                              :dest-conn (:dest-conn ctx)}))
-;        (:assertions scenario)))))
+(deftest tuple-scenarios-restore-db
+  (doseq [scenario tuple-test-scenarios
+          :when (not (#{"Composite tuples added after data"
+                        "Composite tuples with renamed component attributes"}
+                      (:name scenario)))]
+    (with-open [ctx (testh/test-ctx {})]
+      (run-restore-test ctx
+        (:schema scenario)
+        (fn [ctx]
+          (backup/restore-db {:source    (:source-conn ctx)
+                              :dest-conn (:dest-conn ctx)}))
+        (:assertions scenario)))))
 
 (deftest get-backup-test
   (with-open [ctx (testh/test-ctx {})]
@@ -319,26 +319,6 @@
                     :backup-file (testh/tempfile)})]
       (is (= {:tx-count 0} backup)
         "db with no transactions yields empty list"))))
-
-(deftest backup->conn-integration-test
-  (with-open [ctx (testh/test-ctx {})]
-    (testing "schema, test data additions only"
-      (testh/test-data! (:source-conn ctx))
-      (let [file (testh/tempfile)
-            backup (backup/backup-db {:source-conn (:source-conn ctx)
-                                      :backup-file file})]
-        (backup/restore-db {:source    file
-                            :dest-conn (:dest-conn ctx)})
-        (is (= {:school/id       1
-                :school/students [{:student/email "johndoe@university.edu"
-                                   :student/first "John"
-                                   :student/last  "Doe"}]}
-              (d/pull (d/db (:dest-conn ctx))
-                [:school/id
-                 {:school/students [:student/first
-                                    :student/last
-                                    :student/email]}]
-                [:school/id 1])))))))
 
 (deftest conn->conn-integration-test
   (with-open [ctx (testh/test-ctx {})]
@@ -357,36 +337,58 @@
                                   :student/email]}]
               [:school/id 1]))))))
 
-(deftest backup-current-db-integration-test
-  (with-open [ctx (testh/test-ctx {})]
-    (testh/test-data! (:source-conn ctx))
-    (testing "restore conn -> conn"
-      (let [file (testh/tempfile)
-            backup (backup/backup-db-no-history {:source-conn                (:source-conn ctx)
-                                                 :remove-empty-transactions? true
-                                                 :backup-file                file
-                                                 :filter                     {:exclude-attrs [:student/first]}})]
-        (is (= 3
-              (count
-                (with-open [rdr (io/reader file)]
-                  (vec (impl/transactions-from-source rdr {}))))))
-        (backup/restore-db {:source    file
-                            :progress? true
-                            :dest-conn (:dest-conn ctx)})
-        (is (= {:school/id       1
-                :school/students [{:student/email "johndoe@university.edu"
-                                   :student/last  "Doe"}]}
-              (d/pull (d/db (:dest-conn ctx))
-                [:school/id
-                 {:school/students [:student/first
-                                    :student/last
-                                    :student/email]}]
-                [:school/id 1])))
-        (is (= (list)
-              (d/datoms (d/history (d/db (:dest-conn ctx)))
-                {:index      :eavt
-                 :components [[:course/id "BIO-102"]]}))
-          "no history of entity is included")))))
+;; TODO: 2025-10-25: comment out file based source since it become unsupported
+;; To support, we need q-datomic-internal-source-eid->dest-eid for file based
+;(deftest backup->conn-integration-test
+;  (with-open [ctx (testh/test-ctx {})]
+;    (testing "schema, test data additions only"
+;      (testh/test-data! (:source-conn ctx))
+;      (let [file (testh/tempfile)
+;            backup (backup/backup-db {:source-conn (:source-conn ctx)
+;                                      :backup-file file})]
+;        (backup/restore-db {:source    file
+;                            :dest-conn (:dest-conn ctx)})
+;        (is (= {:school/id       1
+;                :school/students [{:student/email "johndoe@university.edu"
+;                                   :student/first "John"
+;                                   :student/last  "Doe"}]}
+;              (d/pull (d/db (:dest-conn ctx))
+;                [:school/id
+;                 {:school/students [:student/first
+;                                    :student/last
+;                                    :student/email]}]
+;                [:school/id 1])))))))
+
+;(deftest backup-current-db-integration-test
+;  (with-open [ctx (testh/test-ctx {})]
+;    (testh/test-data! (:source-conn ctx))
+;    (testing "restore conn -> conn"
+;      (let [file (testh/tempfile)
+;            backup (backup/backup-db-no-history {:source-conn                (:source-conn ctx)
+;                                                 :remove-empty-transactions? true
+;                                                 :backup-file                file
+;                                                 :filter                     {:exclude-attrs [:student/first]}})]
+;        (is (= 3
+;              (count
+;                (with-open [rdr (io/reader file)]
+;                  (vec (impl/transactions-from-source rdr {}))))))
+;        (backup/restore-db {:source    file
+;                            :progress? true
+;                            :dest-conn (:dest-conn ctx)})
+;        (is (= {:school/id       1
+;                :school/students [{:student/email "johndoe@university.edu"
+;                                   :student/last  "Doe"}]}
+;              (d/pull (d/db (:dest-conn ctx))
+;                [:school/id
+;                 {:school/students [:student/first
+;                                    :student/last
+;                                    :student/email]}]
+;                [:school/id 1])))
+;        (is (= (list)
+;              (d/datoms (d/history (d/db (:dest-conn ctx)))
+;                {:index      :eavt
+;                 :components [[:course/id "BIO-102"]]}))
+;          "no history of entity is included")))))
 
 (deftest current-state-restore-test
   (with-open [ctx (testh/test-ctx {})]

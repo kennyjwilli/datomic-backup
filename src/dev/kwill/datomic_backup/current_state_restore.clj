@@ -252,14 +252,15 @@
         index-range-argm (cond-> argm
                            start-exclusive
                            (assoc :start start-exclusive))
-        datoms (cond->> (d/index-range db index-range-argm)
-                 start-exclusive
-                 (drop 1))
         *start (volatile! nil)
         *counter (volatile! 0)
         debug (::_debug argm)]
     (try
-      (doseq [d datoms]
+      (doseq [;; datomic-local has differing behavior where d/index-range may throw at all-site an
+              ;; attribute-not-indexed error, so we must wrap in the try/catch.
+              d (cond->> (d/index-range db index-range-argm)
+                  start-exclusive
+                  (drop 1))]
         (when (and debug (zero? (mod (vswap! *counter inc) 10000)))
           (log/info "Reader progress"
             :attrid (:attrid argm)
@@ -275,8 +276,8 @@
             (log/warn "Retryable anomaly while reading datoms. Retrying with :start set..."
               :anomaly (ex-data ex)
               :start-exclusive @*start))
-          ;; This will occur occasionally and not sure why... Need to investigate
-          ;; Likely related to :db/ensure & enum idents
+          ;; In Cloud, all attributes are indexed, so this could only get hit if we pass in something
+          ;; that can never have a value (e.g., a :db/ident).
           (= :db.error/attribute-not-indexed (:db/error (ex-data ex)))
           (log/warn "Skipping not indexed attribute " :attrid (:attrid argm))
           :else
@@ -906,6 +907,12 @@
           :non-ref)))
     (vals ident->schema)))
 
+(defn indexable-attribute?
+  "Returns true if the attribute schema is possibly indexed. Specifically, this will ignore any
+  schema that are just :db/ident."
+  [schema]
+  (boolean (:db/valueType schema)))
+
 (defn restore-two-pass
   "Two-pass restore: non-ref datoms first, then ref datoms.
   
@@ -925,6 +932,9 @@
                                (into {}
                                  (comp
                                    (filter #(contains? (set attrs) (:db/ident %)))
+                                   ;; :db/ident only do not ever make sense to restore since they
+                                   ;; cannot have a value.
+                                   (filter indexable-attribute?)
                                    (map (juxt :db/ident identity)))
                                  (::impl/schema-raw schema-lookup)))
 
@@ -983,7 +993,7 @@
                       :pass2-duration-sec (int (/ pass2-duration 1000))
                       :total-transactions (+ (:tx-count pass1-result) (:tx-count pass2-result 0))
                       :total-datoms       (+ (:tx-datom-count pass1-result) (:tx-datom-count pass2-result 0))}
-     :old-id->new-id (:old-id->new-id pass2-result)}))
+     :old-id->new-id (or (:old-id->new-id pass2-result) (:old-id->new-id pass1-result))}))
 
 (defn restore
   "Restores a database by copying schema and current datom state.
@@ -1022,4 +1032,4 @@
                            :attrs         composite-tuple-attrs
                            :schema-lookup schema-lookup})
             (add-tuple-attrs! {:dest-conn dest-conn :tuple-schema composite-tuple-schema}))]
-    (assoc result :as-of-t (:t source-db))))
+    (assoc result :last-source-tx (impl/q-last-tx source-db))))

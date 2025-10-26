@@ -30,6 +30,14 @@ jobs:
           key: cljdeps-${{ hashFiles('deps.edn') }}
           restore-keys: cljdeps-
 
+      - name: Setup Datomic Local config
+        run: |
+          mkdir -p ~/.datomic
+          echo '{:storage-dir "/tmp/datomic-storage"}' > ~/.datomic/local.edn
+
+      - name: Setup MBrainz test database
+        run: clojure -X:test setup-mbrainz/setup!
+
       - name: Run CLJ Tests
         run: ./bin/kaocha --profile ci
 

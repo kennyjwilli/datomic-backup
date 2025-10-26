@@ -68,25 +68,6 @@
     (log/info "bootstrap-datoms: complete, returning datoms")
     result))
 
-(defn get-transaction-stream
-  [conn {:keys [ignore-datom start stop timeout]}]
-  (log/info "get-transaction-stream: calling d/tx-range" :start start :stop stop :timeout timeout)
-  (eduction
-    (comp
-      (map (fn [{:keys [data]}] (remove ignore-datom data)))
-      (filter seq))
-    (d/tx-range conn (cond-> {:limit -1}
-                       start (assoc :start start)
-                       stop (assoc :end stop)
-                       timeout (assoc :timeout timeout)))))
-
-(comment
-  (def bs-eids (into #{} (map :e) (bootstrap-datoms (d/db conn))))
-
-  (initial-eid-mapping (d/db dest-conn))
-  (def transactions
-    (get-transaction-stream conn {:ignore-datom (fn [d] (contains? bs-eids (:e d)))})))
-
 (defn initial-eid-mapping
   [dest-db]
   (into {}
@@ -101,19 +82,16 @@
 (defn tempid [x] (str tid-prefix x))
 
 (defn datom-batch-tx-data
-  [dest-db datoms eid->real-eid]
-  (log/info "datom-batch-tx-data: starting" :datoms-count (count datoms))
-  (let [effective-eid (fn [eid] (get eid->real-eid eid (tempid eid)))
-        ref? (fn [a] (= :db.type/ref (attr-value-type dest-db a)))
-        result (map (fn [d]
-                      (let [[e a v tx added] d]
-                        [(if added :db/add :db/retract)
-                         (if (= e tx) "datomic.tx" (effective-eid (:e d)))
-                         (effective-eid a)
-                         (if (ref? a) (effective-eid v) v)]))
-                 datoms)]
-    (log/info "datom-batch-tx-data: complete")
-    result))
+  [dest-db datoms source-eid->dest-eid]
+  (let [effective-eid (fn [eid] (get source-eid->dest-eid eid (tempid eid)))
+        ref? (fn [a] (= :db.type/ref (attr-value-type dest-db a)))]
+    (map (fn [d]
+           (let [[e a v tx added] d]
+             [(if added :db/add :db/retract)
+              (if (= e tx) "datomic.tx" (effective-eid (:e d)))
+              (effective-eid a)
+              (if (ref? a) (effective-eid v) v)]))
+      datoms)))
 
 (comment
   (let [[e a v tx] (first (d/datoms (d/db dest-conn) {:index :eavt}))]
@@ -228,25 +206,22 @@
     (line-seq reader)))
 
 (defn transactions-from-conn
-  [source-conn {:keys [start stop transform-datoms]}]
-  (log/info "transactions-from-conn: starting, getting db")
+  [source-conn {:keys [start stop transform-datoms timeout]}]
   (let [db (d/db source-conn)
-        _ (log/info "transactions-from-conn: got db" :stop stop :db-t (:t db))
-        stop-t (or stop (:t db))
-        _ (log/info "transactions-from-conn: calling bootstrap-datoms")
-        ignore-ids (into #{} (map :e) (bootstrap-datoms db))
-        _ (log/info "transactions-from-conn: bootstrap-datoms complete" :ignore-ids-count (count ignore-ids))
-        _ (log/info "transactions-from-conn: creating eduction" :start start :stop-t stop-t)]
-    (log/info "transactions-from-conn: calling get-transaction-stream")
+        exclusive-stop-t (or stop (inc (:t db)))
+        ignore-ids (into #{} (map :e) (bootstrap-datoms db))]
+    ;; TODO: this very likely needs the same retry logic we've used before.
+    ;; TODO: it may make more sense to just do a get-transaction for a single t rather than eduction
     (eduction
       (comp
+        (map (fn [{:keys [data]}] (remove (fn [d] (contains? ignore-ids (:e d))) data)))
+        (filter seq)
         (map (or transform-datoms identity))
         (filter seq))
-      (get-transaction-stream source-conn
-        (cond-> {:ignore-datom (fn [d] (contains? ignore-ids (:e d)))
-                 :stop         stop-t}
-          start
-          (assoc :start start))))))
+      (d/tx-range source-conn
+        (cond-> {:limit -1 :end exclusive-stop-t}
+          start (assoc :start start)
+          timeout (assoc :timeout timeout))))))
 
 (defn conn? [x] (satisfies? client-protocols/Connection x))
 
@@ -258,29 +233,19 @@
 
 (defn next-datoms-state
   [{:keys [source-eid->dest-eid db-before] :as acc} datoms tx!]
-  (let [tx (:tx (first datoms))]
-    (log/info "next-datoms-state: starting" :tx tx :datoms-count (count datoms))
-    (log/info "next-datoms-state: calling datom-batch-tx-data")
-    (let [tx-data (datom-batch-tx-data db-before datoms source-eid->dest-eid)
-          _ (log/info "next-datoms-state: got tx-data" :count (count tx-data))
-          _ (log/info "next-datoms-state: calling tx! function")
-          tx-report (try
-                      (retry/with-retry #(tx! {:tx-data tx-data}))
-                      (catch Exception ex
-                        (throw
-                          (ex-info (.getMessage ex)
-                            {:tx-data              tx-data
-                             :source-eid->dest-eid source-eid->dest-eid
-                             :tx-count             (:tx-count acc)} ex))))
-          _ (log/info "next-datoms-state: tx! complete, processing result")
-          nd (next-data tx-report)]
-      (log/info "next-datoms-state: complete, returning new state")
-      (-> acc
-        (assoc
-          :db-before (:db-after tx-report)
-          :last-imported-tx tx)
-        (update :source-eid->dest-eid merge (:source-eid->dest-eid nd))
-        (update :tx-count inc)))))
+  (let [tx-data (datom-batch-tx-data db-before datoms source-eid->dest-eid)
+        tx-report (try
+                    (retry/with-retry #(tx! {:tx-data tx-data}))
+                    (catch Exception ex
+                      ;; (sc.api/spy)
+                      (throw ex)))
+        nd (next-data tx-report)]
+    (-> acc
+      (assoc
+        :db-before (:db-after tx-report)
+        :last-source-tx (:tx (first datoms)))
+      (update :source-eid->dest-eid merge (:source-eid->dest-eid nd))
+      (update :tx-count inc))))
 
 (def separator (System/getProperty "line.separator"))
 
@@ -290,7 +255,7 @@
   (.write writer separator)
   (let [tx (:tx (first datoms))]
     (-> acc
-      (assoc :last-imported-tx tx)
+      (assoc :last-source-tx tx)
       (update :tx-count inc))))
 
 (let [fmt-num #(format "%,d" %)]
@@ -312,26 +277,32 @@
       (cond-> (assoc state :total-expected-txes total-txes)
         report? (assoc :last-reported-percent perc-done)))))
 
-(defn get-next-tx-id
-  [conn]
-  (-> (d/with-db conn)
-    (d/with {:tx-data []})
-    :tx-data
-    first
-    :tx))
+(defn q-last-tx
+  [db]
+  (ffirst (d/q '[:find (max ?tx) :where [?tx :db/txInstant]] db)))
+
+(defn tx->t
+  [conn tx]
+  (let [{:keys [t]} (first (d/tx-range conn {:start tx :end (inc tx)}))]
+    t))
+
+(defn t->tx
+  [conn t]
+  (let [{:keys [data]} (first (d/tx-range conn {:start t :end (inc t)}))]
+    (:tx (first data))))
 
 (defn max-tx-id-from-source
   [source]
   (if (conn? source)
-    (get-next-tx-id source)
+    (q-last-tx (d/db source))
     (last-backed-up-tx-id source)))
 
 (defn write-state-file!
   [state-file {:keys [:source-eid->dest-eid
-                      :last-imported-tx]}]
+                      :last-source-tx]}]
   (spit state-file
-    (cond-> {:version          1
-             :last-imported-tx last-imported-tx}
+    (cond-> {:version        1
+             :last-source-tx last-source-tx}
       source-eid->dest-eid (assoc :source-eid->dest-eid source-eid->dest-eid))))
 
 (defn get-old->new-ident-lookup
@@ -424,3 +395,26 @@
         old->new-ident-lookup (get-old->new-ident-lookup db)]
     (assoc (schema-result->lookup user-schema)
       ::old->new-ident-lookup old->new-ident-lookup)))
+
+(defn q-datomic-internal-ident->eid
+  [db]
+  (into {}
+    (d/q '[:find ?ident ?e
+           :where
+           [?e :db/ident ?ident]
+           [(str ?ident) ?ident-s]
+           [(.startsWith ^String ?ident-s ":db")]]
+      db)))
+
+(defn q-datomic-internal-source-eid->dest-eid
+  [source-db dest-db]
+  (let [source-ident->eid (q-datomic-internal-ident->eid source-db)
+        dest-ident->eid (q-datomic-internal-ident->eid dest-db)]
+    (into {}
+      (map (fn [[ident source-eid]]
+             (let [dest-eid (get dest-ident->eid ident)]
+               (when-not dest-eid
+                 (throw (ex-info (format "Missing internal Datomic attribute %s in dest-db" (str ident))
+                          {:ident ident :source-eid source-eid})))
+               [source-eid dest-eid])))
+      source-ident->eid)))

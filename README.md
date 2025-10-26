@@ -11,7 +11,48 @@ Efficiently clone Datomic databases for testing and development.
 
 ## Usage
 
+### incremental-restore
+
+**Recommended for most use cases.** Performs incremental, resumable restore with automatic catch-up using a sidecar state database to track progress.
+
+- **First call**: Executes `current-state-restore` and stores state
+- **Subsequent calls**: Automatically catches up via transaction replay from the last restore point
+
+```clojure
+(require
+  '[datomic.client.api :as d]
+  '[dev.kwill.datomic-backup :as datomic-backup])
+
+(def source-conn (d/connect client {:db-name "source"}))
+(def dest-conn (d/connect client {:db-name "destination"}))
+(def state-conn (d/connect client {:db-name "restore-state"}))
+
+(datomic-backup/incremental-restore
+  {:source-conn source-conn
+   :dest-conn dest-conn
+   :state-conn state-conn})
+```
+
+#### Options
+
+- `:source-conn` - Source database connection (required)
+- `:dest-conn` - Destination database connection (required)
+- `:state-conn` - State database connection for tracking restore progress (required)
+- `:eid-mapping-batch-size` - EID mappings per state transaction (default: 1000)
+- All `current-state-restore` options (max-batch-size, read-parallelism, etc.)
+
+#### Returns
+
+```clojure
+{:status :initial                  ; or :incremental
+ :session-id <uuid>
+ :last-source-tx <tx-id>
+ :transactions-replayed <n>}       ; for :incremental only
+```
+
 ### current-state-restore
+
+**Use for one-time restores or when you don't want a sidecar state database.**
 
 Restores the current state (no history) from a source database to a destination connection. This is significantly faster than replaying transactions.
 
