@@ -895,7 +895,7 @@
           (= value-type :db.type/tuple)
           (let [types (or
                         ;; Composite tuple - get valueType of each tupleAttr
-                        (->> attr-schema :db/tupleAttrs (map #(get-in ident->schema [% :db/valueType])))
+                        (->> attr-schema :db/tupleAttrs (map #(get-in ident->schema [% :db/valueType])) seq)
                         ;; Heterogeneous tuple - explicit types
                         (:db/tupleTypes attr-schema)
                         ;; Homogeneous tuple
