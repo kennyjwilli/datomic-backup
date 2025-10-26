@@ -209,3 +209,29 @@
 (deftest composite-tuple-with-refs-test
   (composite-tuple-with-refs-test-impl
     #(backup/restore-db {:source (:source-conn %) :dest-conn (:dest-conn %)})))
+
+;; Current-state restore variants of the above tests
+
+(deftest heterogeneous-tuple-all-refs-current-state-test
+  (heterogeneous-tuple-all-refs-test-impl
+    #(backup/current-state-restore {:source-db (d/db (:source-conn %)) :dest-conn (:dest-conn %)})))
+
+(deftest heterogeneous-tuple-mixed-types-current-state-test
+  (heterogeneous-tuple-mixed-types-test-impl
+    #(backup/current-state-restore {:source-db (d/db (:source-conn %)) :dest-conn (:dest-conn %)})))
+
+(deftest heterogeneous-tuple-with-nil-current-state-test
+  (heterogeneous-tuple-with-nil-test-impl
+    #(backup/current-state-restore {:source-db (d/db (:source-conn %)) :dest-conn (:dest-conn %)})))
+
+(deftest homogeneous-tuple-refs-current-state-test
+  (homogeneous-tuple-refs-test-impl
+    #(backup/current-state-restore {:source-db (d/db (:source-conn %)) :dest-conn (:dest-conn %)})))
+
+(deftest homogeneous-tuple-scalars-current-state-test
+  (homogeneous-tuple-scalars-test-impl
+    #(backup/current-state-restore {:source-db (d/db (:source-conn %)) :dest-conn (:dest-conn %)})))
+
+(deftest composite-tuple-with-refs-current-state-test
+  (composite-tuple-with-refs-test-impl
+    #(backup/current-state-restore {:source-db (d/db (:source-conn %)) :dest-conn (:dest-conn %)})))
