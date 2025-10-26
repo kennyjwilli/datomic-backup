@@ -274,6 +274,7 @@
 
         ;; Return result
         (assoc result
+          :status :initial
           :stats stats
           :session-id session-id))
 

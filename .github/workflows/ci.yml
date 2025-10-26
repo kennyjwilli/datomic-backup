@@ -30,6 +30,9 @@ jobs:
           key: cljdeps-${{ hashFiles('deps.edn') }}
           restore-keys: cljdeps-
 
+      - name: Setup MBrainz test database
+        run: clojure -X:test setup-mbrainz/setup!
+
       - name: Run CLJ Tests
         run: ./bin/kaocha --profile ci
 

@@ -1,15 +1,14 @@
 (ns mbrainz-sandbox
   (:require
-    [sc.api]
     [datomic.client.api :as d]
     [dev.kwill.datomic-backup :as backup]
     [dev.kwill.datomic-backup.restore-state :as rs]
-    [dev.kwill.datomic-backup.impl :as impl]))
+    [dev.kwill.datomic-backup.test-helpers :as h]
+    [sc.api]))
 
 (comment
-  (def mbrainz-client (d/client {:server-type :datomic-local
-                                 :system      "mbrainz"}))
-  (def source-conn (d/connect mbrainz-client {:db-name "mbrainz-1968-1973"}))
+  (def mbrainz-client (h/mbrainz-client))
+  (def source-conn (d/connect mbrainz-client {:db-name h/mbrainz-db-name}))
 
   (def client (d/client {:server-type :datomic-local
                          :system      "mbrainz-restore"}))
@@ -36,5 +35,5 @@
                                  :dest-conn   dest-conn
                                  :state-conn  state-conn}))
 
-  (def x (rs/load-eid-mappings (d/db state-conn) (:session-id result-incremental)))
-  )
+  (def x (rs/load-eid-mappings (d/db state-conn) (:session-id result-incremental))))
+  
