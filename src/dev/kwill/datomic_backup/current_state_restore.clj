@@ -84,7 +84,8 @@
         e-id (or (get old-id->new-id e) (str e))
         resolve-v (fn [value-type v]
                     (if (= value-type :db.type/ref)
-                      (or (get old-id->new-id v) (str v))
+                      ;; nil is allowable in a tuple
+                      (if (nil? v) nil (or (get old-id->new-id v) (str v)))
                       v))
         value-type (:db/valueType attr-schema)
         [v-id req-eids] (cond
@@ -98,7 +99,9 @@
                                 eids (into #{}
                                        (comp
                                          (filter (fn [[t]] (= t :db.type/ref)))
-                                         (map (fn [[_ v]] v)))
+                                         (map (fn [[_ v]] v))
+                                         ;; nil is an allowable value but should not be in the required eids
+                                         (filter some?))
                                        (map vector types v))]
                             [(mapv (fn [type v] (resolve-v type v)) types v)
                              eids]))
