@@ -276,8 +276,8 @@
             (log/warn "Retryable anomaly while reading datoms. Retrying with :start set..."
               :anomaly (ex-data ex)
               :start-exclusive @*start))
-          ;; This will occur occasionally and not sure why... Need to investigate
-          ;; Likely related to :db/ensure & enum idents
+          ;; In Cloud, all attributes are indexed, so this could only get hit if we pass in something
+          ;; that can never have a value (e.g., a :db/ident).
           (= :db.error/attribute-not-indexed (:db/error (ex-data ex)))
           (log/warn "Skipping not indexed attribute " :attrid (:attrid argm))
           :else
@@ -907,6 +907,12 @@
           :non-ref)))
     (vals ident->schema)))
 
+(defn indexable-attribute?
+  "Returns true if the attribute schema is possibly indexed. Specifically, this will ignore any
+  schema that are just :db/ident."
+  [schema]
+  (boolean (:db/valueType schema)))
+
 (defn restore-two-pass
   "Two-pass restore: non-ref datoms first, then ref datoms.
   
@@ -926,6 +932,9 @@
                                (into {}
                                  (comp
                                    (filter #(contains? (set attrs) (:db/ident %)))
+                                   ;; :db/ident only do not ever make sense to restore since they
+                                   ;; cannot have a value.
+                                   (filter indexable-attribute?)
                                    (map (juxt :db/ident identity)))
                                  (::impl/schema-raw schema-lookup)))
 
