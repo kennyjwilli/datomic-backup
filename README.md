@@ -6,7 +6,7 @@ Efficiently clone Datomic databases for testing and development.
 
 ```clojure
 ;; deps.edn
-{:deps {dev.kwill/datomic-backup {:mvn/version "1.0.10"}}}
+{:deps {dev.kwill/datomic-backup {:mvn/version "1.0.13"}}}
 ```
 
 ## Usage
