@@ -28,10 +28,10 @@
     :db/cardinality :db.cardinality/one
     :db/doc         "Name of the destination database"}
 
-   {:db/ident       :kwill.datomic-backup.session/last-restored-t
+   {:db/ident       :kwill.datomic-backup.session/last-source-tx
     :db/valueType   :db.type/long
     :db/cardinality :db.cardinality/one
-    :db/doc         "Last basis-t value successfully restored from source"}
+    :db/doc         "Last source transaction ID successfully restored"}
 
    ;; EID mapping tracking
    {:db/ident       :kwill.datomic-backup.eid-mapping/session
@@ -126,19 +126,19 @@
       mappings)))
 
 (defn update-restore-state!
-  "Update the restore state with new mappings and last-restored-t.
+  "Update the restore state with new mappings and last-source-tx.
 
    Options:
    - :session-id - UUID of the session
    - :new-mappings - Map of source-eid -> dest-eid
-   - :last-restored-t - New basis-t value
+   - :last-source-tx - New source transaction ID
    - :batch-size - Number of mappings per transaction
 
    Returns nil."
-  [state-conn {:keys [session-id new-mappings last-restored-t batch-size]}]
-  ;; Update the session's last-restored-t
-  (d/transact state-conn {:tx-data [{:db/id                                        [:kwill.datomic-backup.session/id session-id]
-                                     :kwill.datomic-backup.session/last-restored-t last-restored-t}]})
+  [state-conn {:keys [session-id new-mappings last-source-tx batch-size]}]
+  ;; Update the session's last-source-tx
+  (d/transact state-conn {:tx-data [{:db/id                                       [:kwill.datomic-backup.session/id session-id]
+                                     :kwill.datomic-backup.session/last-source-tx last-source-tx}]})
 
   ;; Then, insert new mappings in batches
   (when (seq new-mappings)

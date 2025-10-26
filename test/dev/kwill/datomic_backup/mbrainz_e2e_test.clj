@@ -37,7 +37,7 @@
               (is (map? result) "Should return a result map")
               (is (contains? result :old-id->new-id) "Should contain EID mappings")
               (is (pos? (count (:old-id->new-id result))) "Should have EID mappings")
-              (is (contains? result :as-of-t) "Should contain as-of-t")
+              (is (contains? result :last-source-tx) "Should contain last-source-tx")
               (is (contains? result :stats) "Should contain stats")))
 
           ;; Verify schema was copied

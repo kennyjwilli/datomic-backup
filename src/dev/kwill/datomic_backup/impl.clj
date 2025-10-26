@@ -243,7 +243,7 @@
     (-> acc
       (assoc
         :db-before (:db-after tx-report)
-        :last-imported-t (:t (:db-after tx-report)))
+        :last-source-tx (:tx (first datoms)))
       (update :source-eid->dest-eid merge (:source-eid->dest-eid nd))
       (update :tx-count inc))))
 
@@ -255,7 +255,7 @@
   (.write writer separator)
   (let [tx (:tx (first datoms))]
     (-> acc
-      (assoc :last-imported-tx tx)
+      (assoc :last-source-tx tx)
       (update :tx-count inc))))
 
 (let [fmt-num #(format "%,d" %)]
@@ -285,10 +285,10 @@
 
 (defn write-state-file!
   [state-file {:keys [:source-eid->dest-eid
-                      :last-imported-tx]}]
+                      :last-source-tx]}]
   (spit state-file
-    (cond-> {:version          1
-             :last-imported-tx last-imported-tx}
+    (cond-> {:version        1
+             :last-source-tx last-source-tx}
       source-eid->dest-eid (assoc :source-eid->dest-eid source-eid->dest-eid))))
 
 (defn get-old->new-ident-lookup
@@ -404,3 +404,17 @@
                           {:ident ident :source-eid source-eid})))
                [source-eid dest-eid])))
       source-ident->eid)))
+
+(defn q-last-tx
+  [db]
+  (ffirst (d/q '[:find (max ?tx) :where [?tx :db/txInstant]] db)))
+
+(defn tx->t
+  [conn tx]
+  (let [{:keys [t]} (first (d/tx-range conn {:start tx :end (inc tx)}))]
+    t))
+
+(defn t->tx
+  [conn t]
+  (let [{:keys [data]} (first (d/tx-range conn {:start t :end (inc t)}))]
+    (:tx (first data))))

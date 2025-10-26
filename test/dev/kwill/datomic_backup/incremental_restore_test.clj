@@ -157,19 +157,19 @@
       (let [state-conn (:state-conn ctx)]
         (rs/ensure-schema! state-conn)
 
-        (testing "Update last-restored-t"
+        (testing "Update last-source-tx"
           (let [session (rs/create-session! state-conn "src" "dst")
                 session-id (:kwill.datomic-backup.session/id session)]
 
             (rs/update-restore-state! state-conn
-              {:session-id      session-id
-               :new-mappings    {}
-               :last-restored-t 1000
-               :batch-size      100})
+              {:session-id     session-id
+               :new-mappings   {}
+               :last-source-tx 1000
+               :batch-size     100})
 
             (let [db (d/db state-conn)
                   updated-session (rs/find-session db "src" "dst")]
-              (is (= 1000 (:kwill.datomic-backup.session/last-restored-t updated-session))))))
+              (is (= 1000 (:kwill.datomic-backup.session/last-source-tx updated-session))))))
 
         (testing "Combined update: both t and mappings"
           (let [session (rs/create-session! state-conn "src-4" "dst-4")
@@ -179,23 +179,23 @@
 
             ;; First update
             (rs/update-restore-state! state-conn
-              {:session-id      session-id
-               :new-mappings    mappings1
-               :last-restored-t 4000
-               :batch-size      100})
+              {:session-id     session-id
+               :new-mappings   mappings1
+               :last-source-tx 4000
+               :batch-size     100})
 
             ;; Second update with new mappings and new t
             (rs/update-restore-state! state-conn
-              {:session-id      session-id
-               :new-mappings    mappings2
-               :last-restored-t 5000
-               :batch-size      100})
+              {:session-id     session-id
+               :new-mappings   mappings2
+               :last-source-tx 5000
+               :batch-size     100})
 
             (let [db (d/db state-conn)
                   session (rs/find-session db "src-4" "dst-4")
                   all-mappings (rs/load-eid-mappings db session-id)]
 
-              (is (= 5000 (:kwill.datomic-backup.session/last-restored-t session))
+              (is (= 5000 (:kwill.datomic-backup.session/last-source-tx session))
                 "Should have latest t value")
               (is (= (merge mappings1 mappings2) all-mappings)
                 "Should have all mappings from both updates"))))))))
@@ -221,10 +221,10 @@
 
           ;; Step 3: First batch of restore
           (rs/update-restore-state! state-conn
-            {:session-id      session-id
-             :new-mappings    {1000 2000, 1001 2001, 1002 2002}
-             :last-restored-t 100
-             :batch-size      100})
+            {:session-id     session-id
+             :new-mappings   {1000 2000, 1001 2001, 1002 2002}
+             :last-source-tx 100
+             :batch-size     100})
 
           ;; Step 4: Load mappings for next restore
           (let [db (d/db state-conn)
@@ -232,14 +232,14 @@
                 session-after-batch1 (rs/find-session db "my-source" "my-dest")]
 
             (is (= {1000 2000, 1001 2001, 1002 2002} mappings-after-batch1))
-            (is (= 100 (:kwill.datomic-backup.session/last-restored-t session-after-batch1))))
+            (is (= 100 (:kwill.datomic-backup.session/last-source-tx session-after-batch1))))
 
           ;; Step 5: Second batch of restore (incremental)
           (rs/update-restore-state! state-conn
-            {:session-id      session-id
-             :new-mappings    {1003 2003, 1004 2004}
-             :last-restored-t 200
-             :batch-size      100})
+            {:session-id     session-id
+             :new-mappings   {1003 2003, 1004 2004}
+             :last-source-tx 200
+             :batch-size     100})
 
           ;; Step 6: Verify cumulative state
           (let [db (d/db state-conn)
@@ -248,7 +248,7 @@
 
             (is (= {1000 2000, 1001 2001, 1002 2002, 1003 2003, 1004 2004} final-mappings)
               "Should have all mappings from both batches")
-            (is (= 200 (:kwill.datomic-backup.session/last-restored-t final-session))
+            (is (= 200 (:kwill.datomic-backup.session/last-source-tx final-session))
               "Should have latest t value"))
 
           ;; Step 7: Verify session persistence across db values

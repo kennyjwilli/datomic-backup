@@ -44,7 +44,7 @@
                                             :dest-conn   dest-conn
                                             :state-conn  state-conn}))
   (rs/load-eid-mappings (d/db state-conn) (:session-id result1))
-  ;; => {:status :initial, :session-id ..., :as-of-t ...}
+  ;; => {:status :initial, :session-id ..., :last-source-tx ...}
 
   ;; Add more data to source
   (d/transact source-conn {:tx-data [{:person/name "Charlie"}]})
@@ -53,7 +53,7 @@
 
   (backup/restore-db {:source    source-conn
                       :dest-conn dest-conn
-                      #_#_:init-state {:last-imported-tx     (:as-of-t result1)
+                      #_#_:init-state {:last-source-tx       (:last-source-tx result1)
                                        :source-eid->dest-eid existing-mappings}})
 
   ;; Second incremental restore (catch-up)

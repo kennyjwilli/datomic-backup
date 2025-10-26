@@ -23,7 +23,7 @@
                      :tx-count 0
                      :db-before init-db
                      :source-eid->dest-eid (merge (:source-eid->dest-eid init-state) internal-source-eid->dest-eid))
-        start-t (some-> (:last-imported-t init-state) inc)
+        start-t (some-> (:last-source-tx init-state) inc)
         transactions (impl/transactions-from-source source
                        (cond-> {}
                          start-t (assoc :start start-t)
@@ -43,9 +43,9 @@
                          (when (zero? (mod tx-count 100))
                            (log/info "Processed transactions"
                              :tx-count tx-count
-                             :last-imported-t (:last-imported-t new-state)
+                             :last-source-tx (:last-source-tx new-state)
                              :max-tx max-t
-                             :percent (when max-t (format "%.1f%%" (* 100.0 (/ (:last-imported-t new-state) max-t))))))
+                             :percent (when max-t (format "%.1f%%" (* 100.0 (/ (:last-source-tx new-state) max-t))))))
                          new-state))
                      init-state transactions)
             _ (log/info "Restore complete" :tx-count (:tx-count result))
@@ -59,14 +59,14 @@
   (let [filter-fn (when-let [fmap (:filter arg-map)]
                     (impl/filter-map->fn (d/db source-conn) fmap))
         max-tx-id (when progress (impl/max-tx-id-from-source source-conn))
-        last-imported-tx (impl/last-backed-up-tx-id backup-file)
+        last-source-tx (impl/last-backed-up-tx-id backup-file)
         init-state (cond-> {:tx-count 0}
-                     last-imported-tx
-                     (assoc :last-imported-tx last-imported-tx))
+                     last-source-tx
+                     (assoc :last-source-tx last-source-tx))
         transactions (impl/transactions-from-source source-conn
                        (cond-> {}
-                         (:last-imported-tx init-state)
-                         (assoc :start (inc (:last-imported-tx init-state)))
+                         (:last-source-tx init-state)
+                         (assoc :start (inc (:last-source-tx init-state)))
                          stop (assoc :stop stop)
                          (or filter-fn transform-datoms)
                          (assoc :transform-datoms
@@ -230,7 +230,7 @@
 
   Returns:
   {:status :initial | :incremental
-   :as-of-t <basis-t>
+   :last-source-tx <transaction-id>  ; Transaction entity ID from source database
    :session-id <uuid>
    :transactions-replayed <n> (only for :incremental, 0 if already up-to-date)
    :old-id->new-id <mappings>  (for :initial)
@@ -245,30 +245,30 @@
         _ (log/info "Starting incremental restore" {:source (:db-name source-db) :dest (:db-name dest-db)})
 
         ;; Find or create session
-        {:kwill.datomic-backup.session/keys [last-restored-t]
+        {:kwill.datomic-backup.session/keys [last-source-tx]
          session-id                         :kwill.datomic-backup.session/id}
         (rs/find-or-create-session! state-conn (:db-name source-db) (:db-name dest-db))]
 
-    (if-not last-restored-t
+    (if-not last-source-tx
       ;; INITIAL RESTORE: No prior restore exists
       (let [_ (log/info "No prior restore found, performing initial current-state restore" {:session-id session-id})
             restore-opts (-> opts
                            (dissoc :state-conn :batch-size)
                            (assoc :source-db source-db :dest-conn dest-conn))
             result (current-state-restore restore-opts)
-            {:keys [old-id->new-id as-of-t stats]} result]
+            {:keys [old-id->new-id last-source-tx stats]} result]
 
         (log/info "Initial restore complete, storing state"
-          {:session-id    session-id
-           :as-of-t       as-of-t
-           :mapping-count (count old-id->new-id)})
+          {:session-id     session-id
+           :last-source-tx last-source-tx
+           :mapping-count  (count old-id->new-id)})
 
         ;; Store all mappings and update session
         (rs/update-restore-state! state-conn
-          {:session-id      session-id
-           :new-mappings    old-id->new-id
-           :last-restored-t as-of-t
-           :batch-size      eid-mapping-batch-size})
+          {:session-id     session-id
+           :new-mappings   old-id->new-id
+           :last-source-tx last-source-tx
+           :batch-size     eid-mapping-batch-size})
 
         (log/info "State stored successfully")
 
@@ -279,37 +279,37 @@
           :session-id session-id))
 
       ;; INCREMENTAL RESTORE: Prior restore exists, perform catch-up
-      (let [current-t (:t source-db)]
+      (let [current-tx (impl/q-last-tx source-db)]
         ;; Validate that source hasn't been reset
-        (when (< current-t last-restored-t)
-          (throw (ex-info "Source database appears to have been reset (current basis-t is lower than last-restored-t)"
-                   {:current-t       current-t
-                    :last-restored-t last-restored-t
-                    :session-id      session-id})))
+        (when (< current-tx last-source-tx)
+          (throw (ex-info "Source database appears to have been reset (current tx is lower than last-source-tx)"
+                   {:current-tx     current-tx
+                    :last-source-tx last-source-tx
+                    :session-id     session-id})))
 
-        (if (= current-t last-restored-t)
+        (if (= current-tx last-source-tx)
           ;; Already up-to-date
           (do
-            (log/info "Already up-to-date, no new transactions to replay" {:session-id session-id :current-t current-t})
+            (log/info "Already up-to-date, no new transactions to replay" {:session-id session-id :current-tx current-tx})
             {:status                :incremental
              :session-id            session-id
-             :as-of-t               current-t
+             :last-source-tx        current-tx
              :transactions-replayed 0})
 
           ;; Perform incremental catch-up
           (do
             (log/info "Performing incremental restore"
               {:session-id       session-id
-               :last-restored-t  last-restored-t
-               :current-t        current-t
-               :transactions-gap (- current-t last-restored-t)})
+               :last-source-tx   last-source-tx
+               :current-tx       current-tx
+               :transactions-gap (- current-tx last-source-tx)})
 
             ;; Load existing mappings
             (let [existing-mappings (rs/load-eid-mappings (d/db state-conn) session-id)
                   _ (log/info "Loaded existing EID mappings" {:count (count existing-mappings)})
 
                   ;; Perform incremental restore using restore-db
-                  init-state {:last-imported-tx     last-restored-t
+                  init-state {:last-source-tx       last-source-tx
                               :source-eid->dest-eid existing-mappings}
                   result (restore-db {:source           source-conn
                                       :dest-conn        dest-conn
@@ -318,7 +318,7 @@
                                                           ;; TODO: support transaction entities
                                                           ;; removed for now due to :db.error/past-tx-instant
                                                           (remove (fn [d] (= (:e d) (:tx d))) datoms))})
-                  {:keys [tx-count source-eid->dest-eid last-imported-t]} result
+                  {:keys [tx-count source-eid->dest-eid last-source-tx]} result
 
                   ;; Filter to only new mappings
                   new-mappings (apply dissoc source-eid->dest-eid (keys existing-mappings))]
@@ -327,19 +327,19 @@
                 {:session-id            session-id
                  :transactions-replayed tx-count
                  :new-mappings          (count new-mappings)
-                 :last-imported-t       last-imported-t})
+                 :last-source-tx        last-source-tx})
 
               ;; Store new mappings and update session
               (rs/update-restore-state! state-conn
-                {:session-id      session-id
-                 :new-mappings    new-mappings
-                 :last-restored-t last-imported-t
-                 :batch-size      eid-mapping-batch-size})
+                {:session-id     session-id
+                 :new-mappings   new-mappings
+                 :last-source-tx last-source-tx
+                 :batch-size     eid-mapping-batch-size})
 
               (log/info "State updated successfully")
 
               ;; Return result
               {:status                :incremental
                :session-id            session-id
-               :as-of-t               last-imported-t
+               :last-source-tx        last-source-tx
                :transactions-replayed tx-count})))))))
