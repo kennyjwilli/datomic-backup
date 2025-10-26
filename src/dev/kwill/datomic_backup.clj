@@ -35,7 +35,6 @@
     (try
       (let [result (reduce
                      (fn [state datoms]
-                       (println datoms)
                        (log/info "reduce fn: received datoms batch" :count (count datoms) :first-tx (:tx (first datoms)))
                        (let [tx! (if with? #(d/with (:db-before state) %) #(transact dest-conn %))
                              new-state (impl/next-datoms-state state datoms tx!)
