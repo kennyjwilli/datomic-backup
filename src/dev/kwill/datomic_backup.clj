@@ -11,7 +11,7 @@
 (defn restore-db
   [{:keys [source dest-conn stop init-state with? transact progress transform-datoms]
     :or   {transact d/transact}}]
-  (let [max-t (when progress (impl/max-tx-id-from-source source))
+  (let [max-tx (when progress (impl/max-tx-id-from-source source))
         ;; source must be a conn since d/tx-range requires it
         source (if (impl/conn? source) source (io/reader (io/file source)))
         init-db ((if with? d/with-db d/db) dest-conn)
@@ -32,7 +32,7 @@
     (log/info "Starting restore"
       :source (if (impl/conn? source) "conn" "file")
       :start-t start-t
-      :max-tx max-t)
+      :max-tx max-tx)
     (try
       (let [result (reduce
                      (fn [state datoms]
@@ -44,8 +44,8 @@
                            (log/info "Processed transactions"
                              :tx-count tx-count
                              :last-source-tx (:last-source-tx new-state)
-                             :max-tx max-t
-                             :percent (when max-t (format "%.1f%%" (* 100.0 (/ (:last-source-tx new-state) max-t))))))
+                             :max-tx max-tx
+                             :percent (when max-tx (format "%.1f%%" (* 100.0 (/ (:last-source-tx new-state) max-tx))))))
                          new-state))
                      init-state transactions)
             _ (log/info "Restore complete" :tx-count (:tx-count result))
