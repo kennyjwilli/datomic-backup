@@ -99,7 +99,48 @@
     :db/valueType   :db.type/tuple
     :db/tupleType   :db.type/keyword
     :db/cardinality :db.cardinality/one
-    :db/doc         "Variable-length tuple of keyword tags"}])
+    :db/doc         "Variable-length tuple of keyword tags"}
+
+   ;; Reference entities for tuple tests
+   {:db/ident       :entity/name
+    :db/valueType   :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/unique      :db.unique/identity}
+
+   ;; Heterogeneous tuple - all refs
+   {:db/ident       :entity/two-refs
+    :db/valueType   :db.type/tuple
+    :db/tupleTypes  [:db.type/ref :db.type/ref]
+    :db/cardinality :db.cardinality/one
+    :db/doc         "Heterogeneous tuple containing two refs"}
+
+   ;; Heterogeneous tuple - mixed types (ref + scalars)
+   {:db/ident       :entity/mixed-tuple
+    :db/valueType   :db.type/tuple
+    :db/tupleTypes  [:db.type/ref :db.type/string :db.type/long]
+    :db/cardinality :db.cardinality/one
+    :db/doc         "Heterogeneous tuple: ref + string + long"}
+
+   ;; Heterogeneous tuple - refs with nil
+   {:db/ident       :entity/refs-with-nil
+    :db/valueType   :db.type/tuple
+    :db/tupleTypes  [:db.type/ref :db.type/ref :db.type/ref]
+    :db/cardinality :db.cardinality/one
+    :db/doc         "Heterogeneous tuple allowing nil values"}
+
+   ;; Homogeneous variable-length tuple of refs
+   {:db/ident       :entity/ref-list
+    :db/valueType   :db.type/tuple
+    :db/tupleType   :db.type/ref
+    :db/cardinality :db.cardinality/one
+    :db/doc         "Variable-length tuple of refs"}
+
+   ;; Homogeneous scalar tuple (control test)
+   {:db/ident       :entity/long-list
+    :db/valueType   :db.type/tuple
+    :db/tupleType   :db.type/long
+    :db/cardinality :db.cardinality/one
+    :db/doc         "Variable-length tuple of longs"}])
 
 (defn test-ctx
   "Create a test context with source, dest, and optionally state connections.
@@ -229,3 +270,9 @@
                  :in $ ?attr
                  :where [?e ?attr]]
             db attr)))
+
+(defn get-eid
+  "Get entity ID from lookup ref"
+  [db lookup-ref]
+  (ffirst (d/q '[:find ?e :in $ ?attr ?val :where [?e ?attr ?val]]
+               db (first lookup-ref) (second lookup-ref))))
