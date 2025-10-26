@@ -78,20 +78,71 @@
   [db attr]
   (get-in (d/pull db [:db/valueType] attr) [:db/valueType :db/ident]))
 
+(defn tuple-element-types
+  "Returns vector of value types for tuple elements, or nil if not a tuple.
+  Handles three tuple variants:
+  - Composite (:db/tupleAttrs) - gets valueType of each constituent
+  - Heterogeneous (:db/tupleTypes) - returns explicit types
+  - Homogeneous (:db/tupleType) - repeats single type"
+  [db attr]
+  (let [attr-schema (d/pull db [:db/valueType :db/tupleAttrs :db/tupleTypes :db/tupleType] attr)
+        value-type (get-in attr-schema [:db/valueType :db/ident])]
+    (when (= value-type :db.type/tuple)
+      (cond
+        ;; Composite tuple - get each constituent's valueType
+        (:db/tupleAttrs attr-schema)
+        (mapv #(attr-value-type db %) (:db/tupleAttrs attr-schema))
+
+        ;; Heterogeneous tuple - explicit types
+        (:db/tupleTypes attr-schema)
+        (:db/tupleTypes attr-schema)
+
+        ;; Homogeneous tuple - repeat indefinitely (will be limited by actual value length)
+        (:db/tupleType attr-schema)
+        (repeat (:db/tupleType attr-schema))))))
+
 (def tid-prefix "__tid")
 (defn tempid [x] (str tid-prefix x))
 
 (defn datom-batch-tx-data
   [dest-db datoms source-eid->dest-eid]
   (let [effective-eid (fn [eid] (get source-eid->dest-eid eid (tempid eid)))
-        ref? (fn [a] (= :db.type/ref (attr-value-type dest-db a)))]
-    (map (fn [d]
-           (let [[e a v tx added] d]
-             [(if added :db/add :db/retract)
-              (if (= e tx) "datomic.tx" (effective-eid (:e d)))
-              (effective-eid a)
-              (if (ref? a) (effective-eid v) v)]))
-      datoms)))
+        ref? (fn [a] (= :db.type/ref (attr-value-type dest-db a)))
+
+        ;; Process value: handle tuples with refs, regular refs, or pass through
+        process-value (fn [attr val]
+                        (cond
+                          ;; Check if this is a tuple attribute
+                          (vector? val)
+                          (if-let [element-types (tuple-element-types dest-db attr)]
+                            ;; It's a tuple - remap refs element-by-element
+                            (mapv (fn [type v]
+                                    (if (= type :db.type/ref)
+                                      (if (nil? v) nil (effective-eid v))
+                                      v))
+                              element-types
+                              val)
+                            ;; Vector but not a tuple (shouldn't happen)
+                            (throw (ex-info "Value is a vector but cannot look up tuple types." {:value val :attr attr})))
+
+                          ;; Regular ref attribute
+                          (ref? attr)
+                          (effective-eid val)
+
+                          ;; Scalar value
+                          :else
+                          val))]
+    (->> datoms
+      ;; TODO: support transaction entity metadata
+      ;; Filter out transaction entity datoms (e.g., :db/txInstant)
+      ;; These will be automatically added by Datomic with fresh timestamps
+      (remove (fn [d] (= (:e d) (:tx d))))
+      (map (fn [d]
+             (let [[e a v tx added] d]
+               [(if added :db/add :db/retract)
+                (if (= e tx) "datomic.tx" (effective-eid (:e d)))
+                (effective-eid a)
+                (process-value a v)]))))))
 
 (comment
   (let [[e a v tx] (first (d/datoms (d/db dest-conn) {:index :eavt}))]
