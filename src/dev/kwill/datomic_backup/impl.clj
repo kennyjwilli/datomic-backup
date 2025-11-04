@@ -330,7 +330,7 @@
 
 (defn q-last-tx
   [db]
-  (ffirst (d/q '[:find (max ?tx) :where [?tx :db/txInstant]] db)))
+  (ffirst (retry/with-retry (d/q '[:find (max ?tx) :where [?tx :db/txInstant]] db))))
 
 (defn tx->t
   [conn tx]
