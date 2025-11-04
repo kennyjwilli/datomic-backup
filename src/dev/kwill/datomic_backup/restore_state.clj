@@ -4,7 +4,8 @@
    Uses a separate Datomic database to track restore sessions and
    entity ID mappings, enabling resumable restores with automatic catch-up."
   (:require [datomic.client.api :as d]
-            [clojure.tools.logging :as log])
+            [clojure.tools.logging :as log]
+            [dev.kwill.datomic-backup.retry :as retry])
   (:import (java.util UUID)))
 
 ;; Schema definition
@@ -62,19 +63,20 @@
 (defn ensure-schema!
   "Install the restore state schema. Idempotent - safe to call multiple times."
   [state-conn]
-  (d/transact state-conn {:tx-data schema})
+  (retry/with-retry #(d/transact state-conn {:tx-data schema}))
   nil)
 
 (defn find-session
   "Find an existing restore session by source and dest database names.
    Returns session entity map or nil if not found."
   [db source-db-name dest-db-name]
-  (let [result (d/q '[:find (pull ?e [*])
-                      :in $ ?source ?dest
-                      :where
-                      [?e :kwill.datomic-backup.session/source-db-name ?source]
-                      [?e :kwill.datomic-backup.session/dest-db-name ?dest]]
-                 db source-db-name dest-db-name)]
+  (let [result (retry/with-retry
+                 #(d/q '[:find (pull ?e [*])
+                         :in $ ?source ?dest
+                         :where
+                         [?e :kwill.datomic-backup.session/source-db-name ?source]
+                         [?e :kwill.datomic-backup.session/dest-db-name ?dest]]
+                    db source-db-name dest-db-name))]
     (when (seq result)
       (ffirst result))))
 
@@ -86,7 +88,7 @@
         session {:kwill.datomic-backup.session/id             session-id
                  :kwill.datomic-backup.session/source-db-name source-db-name
                  :kwill.datomic-backup.session/dest-db-name   dest-db-name}]
-    (d/transact state-conn {:tx-data [session]})
+    (retry/with-retry #(d/transact state-conn {:tx-data [session]}))
     session))
 
 (defn find-or-create-session!
@@ -104,15 +106,16 @@
   "Load all EID mappings for the given session.
    Returns a map from source-eid to dest-eid."
   [db session-id]
-  (let [results (d/q '[:find ?source-eid ?dest-eid
-                       :in $ ?session-id
-                       :where
-                       [?session :kwill.datomic-backup.session/id ?session-id]
-                       [?mapping :kwill.datomic-backup.eid-mapping/session ?session]
-                       [?mapping :kwill.datomic-backup.eid-mapping/source-eid ?source-eid]
-                       [?mapping :kwill.datomic-backup.eid-mapping/dest-eid ?dest-eid]]
-                  db
-                  session-id)]
+  (let [results (retry/with-retry
+                  #(d/q '[:find ?source-eid ?dest-eid
+                          :in $ ?session-id
+                          :where
+                          [?session :kwill.datomic-backup.session/id ?session-id]
+                          [?mapping :kwill.datomic-backup.eid-mapping/session ?session]
+                          [?mapping :kwill.datomic-backup.eid-mapping/source-eid ?source-eid]
+                          [?mapping :kwill.datomic-backup.eid-mapping/dest-eid ?dest-eid]]
+                     db
+                     session-id))]
     (into {} results)))
 
 (defn- eid-mapping-tx-data
@@ -137,13 +140,14 @@
    Returns nil."
   [state-conn {:keys [session-id new-mappings last-source-tx batch-size]}]
   ;; Update the session's last-source-tx
-  (d/transact state-conn {:tx-data [{:db/id                                       [:kwill.datomic-backup.session/id session-id]
-                                     :kwill.datomic-backup.session/last-source-tx last-source-tx}]})
+  (retry/with-retry
+    #(d/transact state-conn {:tx-data [{:db/id                                       [:kwill.datomic-backup.session/id session-id]
+                                        :kwill.datomic-backup.session/last-source-tx last-source-tx}]}))
 
   ;; Then, insert new mappings in batches
   (when (seq new-mappings)
     (log/info "Storing EID mappings" {:session-id session-id :count (count new-mappings)})
     (doseq [batch (partition-all batch-size (seq new-mappings))]
-      (d/transact state-conn {:tx-data (eid-mapping-tx-data session-id batch)})))
+      (retry/with-retry #(d/transact state-conn {:tx-data (eid-mapping-tx-data session-id batch)}))))
 
   nil)
