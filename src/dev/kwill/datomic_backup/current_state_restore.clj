@@ -1010,6 +1010,7 @@
         ;; Heterogeneous (:db/tupleTypes) and homogeneous (:db/tupleType) tuples
         ;; are installed with the initial schema.
         schema-lookup (impl/q-schema-lookup source-db)
+        last-source-tx (retry/with-retry #(impl/q-last-tx source-db))
         non-composite-attrs (into [] (comp (remove :db/tupleAttrs) (map :db/ident)) (::impl/schema-raw schema-lookup))
         _ (log/info "Copying schema (non-composite tuple attributes)"
             :total-attributes (count (::impl/schema-raw schema-lookup))
@@ -1035,4 +1036,4 @@
                            :attrs         composite-tuple-attrs
                            :schema-lookup schema-lookup})
             (add-tuple-attrs! {:dest-conn dest-conn :tuple-schema composite-tuple-schema}))]
-    (assoc result :last-source-tx (impl/q-last-tx source-db))))
+    (assoc result :last-source-tx last-source-tx)))
