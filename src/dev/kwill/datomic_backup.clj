@@ -276,6 +276,7 @@
 
         ;; Return result
         (assoc result
+          :last-source-tx last-source-tx
           :status :initial
           :stats stats
           :session-id session-id))
