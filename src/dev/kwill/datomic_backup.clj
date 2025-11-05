@@ -256,8 +256,8 @@
             restore-opts (-> opts
                            (dissoc :state-conn :batch-size)
                            (assoc :source-db source-db :dest-conn dest-conn))
-            result (current-state-restore restore-opts)
             last-source-tx (retry/with-retry #(impl/t->tx source-conn (:t source-db)))
+            result (current-state-restore restore-opts)
             {:keys [old-id->new-id stats]} result]
 
         (log/info "Initial restore complete, storing state"
