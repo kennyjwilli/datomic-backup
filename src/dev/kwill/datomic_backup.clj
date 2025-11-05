@@ -5,7 +5,8 @@
     [datomic.client.api :as d]
     [dev.kwill.datomic-backup.current-state-restore :as cs-restore]
     [dev.kwill.datomic-backup.impl :as impl]
-    [dev.kwill.datomic-backup.restore-state :as rs])
+    [dev.kwill.datomic-backup.restore-state :as rs]
+    [dev.kwill.datomic-backup.retry :as retry])
   (:import (java.io Closeable)))
 
 (defn restore-db
@@ -256,7 +257,8 @@
                            (dissoc :state-conn :batch-size)
                            (assoc :source-db source-db :dest-conn dest-conn))
             result (current-state-restore restore-opts)
-            {:keys [old-id->new-id last-source-tx stats]} result]
+            last-source-tx (retry/with-retry #(impl/t->tx source-conn (:t source-db)))
+            {:keys [old-id->new-id stats]} result]
 
         (log/info "Initial restore complete, storing state"
           {:session-id     session-id
