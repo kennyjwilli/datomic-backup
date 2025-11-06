@@ -547,7 +547,8 @@
            read-chunk
            tx-parallelism
            init-state
-           attrs]}]
+           attrs
+           max-bootstrap-tx]}]
   (log/info "Starting Pass 1 parallel datom copy"
     :read-parallelism read-parallelism
     :tx-parallelism tx-parallelism
@@ -557,7 +558,6 @@
     :init-state-entities (count (:old-id->new-id init-state)))
 
   (let [eid->schema (::impl/eid->schema schema-lookup)
-        max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
         schema-ids (into #{} (map key) eid->schema)
 
         ;; Channels
@@ -653,7 +653,8 @@
            read-parallelism
            read-chunk
            init-state
-           attrs]}]
+           attrs
+           max-bootstrap-tx]}]
   (log/info "Starting datom read"
     :parallelism read-parallelism
     :chunk-size read-chunk
@@ -669,7 +670,6 @@
              :dest-ch     ch
              :read-chunk  read-chunk})
         eid->schema (::impl/eid->schema schema-lookup)
-        max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
         schema-ids (into #{} (map key) eid->schema)
         init-state (merge {:input-datom-count 0
                            :old-id->new-id    {}
@@ -929,7 +929,7 @@
   Pass 2: Process all ref attributes
   - Most refs resolve immediately
   - Always sequential (due to potential circular refs)"
-  [{:keys [attrs schema-lookup tx-parallelism init-state] :as argm}]
+  [{:keys [attrs schema-lookup tx-parallelism init-state source-db] :as input-argm}]
   (let [{non-ref-attrs :non-ref
          ref-attrs     :ref} (partition-attributes-by-ref
                                (into {}
@@ -948,6 +948,8 @@
             :ref-percentage (format "%.1f%%" (* 100.0 (/ (count ref-attrs) (count attrs))))
             :tx-parallelism tx-parallelism
             :init-state-entities (count (:old-id->new-id init-state)))
+        max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
+        argm (assoc input-argm :max-bootstrap-tx max-bootstrap-tx)
 
         ;; PASS 1: Non-ref attributes
         pass1-start (System/currentTimeMillis)
