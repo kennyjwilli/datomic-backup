@@ -106,17 +106,21 @@
   "Load all EID mappings for the given session.
    Returns a map from source-eid to dest-eid."
   [db session-id]
-  (let [results (retry/with-retry
-                  #(d/q '[:find ?source-eid ?dest-eid
-                          :in $ ?session-id
-                          :where
-                          [?session :kwill.datomic-backup.session/id ?session-id]
-                          [?mapping :kwill.datomic-backup.eid-mapping/session ?session]
-                          [?mapping :kwill.datomic-backup.eid-mapping/source-eid ?source-eid]
-                          [?mapping :kwill.datomic-backup.eid-mapping/dest-eid ?dest-eid]]
-                     db
-                     session-id))]
-    (into {} results)))
+  (let [session-eid (:db/id (retry/with-retry #(d/pull db [:db/id] [:kwill.datomic-backup.session/id session-id])))
+        mappings (retry/with-retry
+                   #(d/index-pull db {:index    :avet
+                                      :selector [:kwill.datomic-backup.eid-mapping/source-eid
+                                                 :kwill.datomic-backup.eid-mapping/dest-eid
+                                                 {:kwill.datomic-backup.eid-mapping/session [:db/id]}]
+                                      :start    [:kwill.datomic-backup.eid-mapping/session session-eid]}))
+        ;; Filter to only this session's mappings
+        session-mappings (take-while #(= session-eid (get-in % [:kwill.datomic-backup.eid-mapping/session :db/id]))
+                           mappings)]
+    (into {}
+      (map (fn [m]
+             [(:kwill.datomic-backup.eid-mapping/source-eid m)
+              (:kwill.datomic-backup.eid-mapping/dest-eid m)]))
+      session-mappings)))
 
 (defn- eid-mapping-tx-data
   "Generate transaction data for a batch of EID mappings."
