@@ -10,8 +10,9 @@
   (:import (java.io Closeable)))
 
 (defn restore-db
-  [{:keys [source dest-conn stop init-state with? transact progress transform-datoms]
-    :or   {transact d/transact}}]
+  [{:keys [source dest-conn stop init-state with? transact progress lookup-dest-eid-fn transform-datoms]
+    :or   {transact           d/transact
+           lookup-dest-eid-fn (constantly nil)}}]
   (let [max-tx (when progress (impl/max-tx-id-from-source source))
         ;; source must be a conn since d/tx-range requires it
         source (if (impl/conn? source) source (io/reader (io/file source)))
@@ -39,7 +40,7 @@
                      (fn [state datoms]
                        (log/info "reduce fn: received datoms batch" :count (count datoms) :first-tx (:tx (first datoms)))
                        (let [tx! (if with? #(d/with (:db-before state) %) #(transact dest-conn %))
-                             new-state (impl/next-datoms-state state datoms tx!)
+                             new-state (impl/next-datoms-state state datoms lookup-dest-eid-fn tx!)
                              tx-count (:tx-count new-state)]
                          (when (zero? (mod tx-count 100))
                            (log/info "Processed transactions"
@@ -308,23 +309,31 @@
                :transactions-gap (- current-tx last-source-tx)})
 
             ;; Load existing mappings
-            (let [existing-mappings (rs/load-eid-mappings (d/db state-conn) session-id)
-                  _ (log/info "Loaded existing EID mappings" {:count (count existing-mappings)})
+            (let [state-db (d/db state-conn)
+                  ;existing-mappings (rs/load-eid-mappings state-db session-id)
+                  ;_ (log/info "Loaded existing EID mappings" {:count (count existing-mappings)})
 
+                  *source->dest-cache (atom {})
+                  lookup-dest-eid-fn (fn [source-eid]
+                                       (or (get @*source->dest-cache source-eid)
+                                         (when-let [dest-eid (rs/q-dest-eid-from-source-eid state-db source-eid)]
+                                           (swap! *source->dest-cache assoc source-eid dest-eid)
+                                           dest-eid)))
                   ;; Perform incremental restore using restore-db
                   init-state {:last-source-tx       last-source-tx
-                              :source-eid->dest-eid existing-mappings}
-                  result (restore-db {:source           source-conn
-                                      :dest-conn        dest-conn
-                                      :init-state       init-state
-                                      :transform-datoms (fn [datoms]
-                                                          ;; TODO: support transaction entities
-                                                          ;; removed for now due to :db.error/past-tx-instant
-                                                          (remove (fn [d] (= (:e d) (:tx d))) datoms))})
+                              :source-eid->dest-eid {}}
+                  result (restore-db {:source             source-conn
+                                      :dest-conn          dest-conn
+                                      :init-state         init-state
+                                      :lookup-dest-eid-fn lookup-dest-eid-fn
+                                      :transform-datoms   (fn [datoms]
+                                                            ;; TODO: support transaction entities
+                                                            ;; removed for now due to :db.error/past-tx-instant
+                                                            (remove (fn [d] (= (:e d) (:tx d))) datoms))})
                   {:keys [tx-count source-eid->dest-eid last-source-tx]} result
 
                   ;; Filter to only new mappings
-                  new-mappings (apply dissoc source-eid->dest-eid (keys existing-mappings))]
+                  new-mappings (apply dissoc source-eid->dest-eid (keys @*source->dest-cache))]
 
               (log/info "Incremental restore complete"
                 {:session-id            session-id
