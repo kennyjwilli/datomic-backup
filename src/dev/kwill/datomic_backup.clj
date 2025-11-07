@@ -282,7 +282,7 @@
           :session-id session-id))
 
       ;; INCREMENTAL RESTORE: Prior restore exists, perform catch-up
-      (let [current-tx (impl/q-last-tx source-db)]
+      (let [current-tx (retry/with-retry #(impl/t->tx source-conn (:t source-db)))]
         ;; Validate that source hasn't been reset
         (when (< current-tx last-source-tx)
           (throw (ex-info "Source database appears to have been reset (current tx is lower than last-source-tx)"
