@@ -1,21 +1,21 @@
 (ns dev.kwill.datomic-backup
   (:require
+    [clojure.core.async :as async]
     [clojure.java.io :as io]
     [clojure.tools.logging :as log]
     [datomic.client.api :as d]
     [dev.kwill.datomic-backup.current-state-restore :as cs-restore]
     [dev.kwill.datomic-backup.impl :as impl]
     [dev.kwill.datomic-backup.restore-state :as rs]
-    [dev.kwill.datomic-backup.retry :as retry])
-  (:import (java.io Closeable)))
+    [dev.kwill.datomic-backup.retry :as retry]))
 
 (defn restore-db
-  [{:keys [source dest-conn stop init-state with? transact progress lookup-dest-eid-fn transform-datoms]
+  [{:keys [source dest-conn stop init-state with? transact progress lookup-dest-eid-fn]
     :or   {transact           d/transact
-           lookup-dest-eid-fn (constantly nil)}}]
-  (let [max-tx (when progress (impl/max-tx-id-from-source source))
-        ;; source must be a conn since d/tx-range requires it
-        source (if (impl/conn? source) source (io/reader (io/file source)))
+           lookup-dest-eid-fn (constantly nil)}
+    :as   argm}]
+  (let [tx-range-datoms-xf (or (:tx-range-datoms-xf argm) (map identity))
+        max-tx (when progress (impl/max-tx-id-from-source source))
         init-db ((if with? d/with-db d/db) dest-conn)
         ;; While most often the Datomic internal DB eids are the same, we should not make that assumption.
         ;; Since we are replaying transactions that may include schema entities (e.g., :db/ident), we must
@@ -26,19 +26,26 @@
                      :db-before init-db
                      :source-eid->dest-eid (merge (:source-eid->dest-eid init-state) internal-source-eid->dest-eid))
         start-t (some-> (:last-source-tx init-state) inc)
-        transactions (impl/transactions-from-source source
-                       (cond-> {}
-                         start-t (assoc :start start-t)
-                         stop (assoc :stop stop)
-                         transform-datoms (assoc :transform-datoms transform-datoms)))]
-    (log/info "Starting restore"
-      :source (if (impl/conn? source) "conn" "file")
-      :start-t start-t
-      :max-tx max-tx)
-    (try
-      (let [result (reduce
-                     (fn [state datoms]
-                       (log/info "reduce fn: received datoms batch" :count (count datoms) :first-tx (:tx (first datoms)))
+        tx-ch (async/chan 100)
+        ignore-ids (into #{} (map :e) (impl/bootstrap-datoms (d/db source)))
+        transactions-xf (comp (remove #(contains? ignore-ids (:e %))) tx-range-datoms-xf)]
+    (log/info "Starting restore" :source "conn" :start-t start-t :max-tx max-tx)
+    ;; Start reading transactions to channel in background
+    (async/thread
+      (try
+        (impl/read-transactions-to-chan! source
+          (cond-> {:xf transactions-xf}
+            start-t (assoc :start start-t)
+            stop (assoc :stop stop))
+          tx-ch)
+        (catch Exception ex
+          (log/error ex "Fatal error reading transactions")
+          (async/close! tx-ch))))
+    ;; Process transactions from channel
+    (let [result (loop [state init-state]
+                   (if-let [datoms (async/<!! tx-ch)]
+                     (do
+                       (log/info "Processing datoms batch" :count (count datoms) :first-tx (:tx (first datoms)))
                        (let [tx! (if with? #(d/with (:db-before state) %) #(transact dest-conn %))
                              new-state (impl/next-datoms-state state datoms lookup-dest-eid-fn tx!)
                              tx-count (:tx-count new-state)]
@@ -48,13 +55,11 @@
                              :last-source-tx (:last-source-tx new-state)
                              :max-tx max-tx
                              :percent (when max-tx (format "%.1f%%" (* 100.0 (/ (:last-source-tx new-state) max-tx))))))
-                         new-state))
-                     init-state transactions)
-            _ (log/info "Restore complete" :tx-count (:tx-count result))
-            source-eid->dest-eid (apply dissoc (:source-eid->dest-eid result) (keys internal-source-eid->dest-eid))]
-        (assoc result :source-eid->dest-eid source-eid->dest-eid))
-      (finally
-        (when (instance? Closeable source) (.close source))))))
+                         (recur new-state)))
+                     state))
+          _ (log/info "Restore complete" :tx-count (:tx-count result))
+          source-eid->dest-eid (apply dissoc (:source-eid->dest-eid result) (keys internal-source-eid->dest-eid))]
+      (assoc result :source-eid->dest-eid source-eid->dest-eid))))
 
 (defn backup-db
   [{:keys [source-conn backup-file stop transform-datoms progress] :as arg-map}]
@@ -65,26 +70,28 @@
         init-state (cond-> {:tx-count 0}
                      last-source-tx
                      (assoc :last-source-tx last-source-tx))
-        transactions (impl/transactions-from-source source-conn
-                       (cond-> {}
-                         (:last-source-tx init-state)
-                         (assoc :start (inc (:last-source-tx init-state)))
-                         stop (assoc :stop stop)
-                         (or filter-fn transform-datoms)
-                         (assoc :transform-datoms
-                           (fn [datoms]
-                             ((comp
-                                (or transform-datoms identity)
-                                (or filter-fn identity))
-                              datoms)))))]
+        tx-ch (async/chan 1000)
+        ignore-ids (into #{} (map :e) (impl/bootstrap-datoms (d/db source-conn)))
+        xf (comp
+             (remove (fn [d] (contains? ignore-ids (:e d))))
+             (map (if transform-datoms transform-datoms identity))
+             (filter (if filter-fn filter-fn identity)))]
+    ;; Start reading transactions to channel in background
+    (async/thread
+      (impl/read-transactions-to-chan! source-conn
+        (cond-> {:xf xf}
+          (:last-source-tx init-state)
+          (assoc :start (inc (:last-source-tx init-state)))
+          stop (assoc :stop stop))
+        tx-ch))
+    ;; Process transactions from channel
     (with-open [wtr (io/writer (io/file backup-file) :append true)]
-      (reduce
-        (fn [state datoms]
-          (cond-> (impl/next-file-state state datoms wtr)
-            progress
-            (impl/next-progress-report progress (:tx (first datoms)) max-tx-id)))
-        init-state
-        transactions))))
+      (loop [state init-state]
+        (if-let [datoms (async/<!! tx-ch)]
+          (recur (cond-> (impl/next-file-state state datoms wtr)
+                   progress
+                   (impl/next-progress-report progress (:tx (first datoms)) max-tx-id)))
+          state)))))
 
 (comment
   (def c (d/client {:server-type :datomic-local
@@ -330,6 +337,9 @@
                                                             ;; TODO: support transaction entities
                                                             ;; removed for now due to :db.error/past-tx-instant
                                                             (remove (fn [d] (= (:e d) (:tx d))) datoms))})
+                                      ;; TODO: support transaction entities
+                                      ;; removed for now due to :db.error/past-tx-instant
+                                      :tx-range-datoms-xf (remove (fn [d] (= (:e d) (:tx d))))})
                   {:keys [tx-count source-eid->dest-eid last-source-tx]} result
 
                   ;; Filter to only new mappings

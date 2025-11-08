@@ -1,14 +1,16 @@
 (ns dev.kwill.datomic-backup.impl
   (:require
+    [clojure.core.async :as async]
+    [clojure.edn :as edn]
     [clojure.java.io :as io]
     [clojure.string :as str]
-    [clojure.edn :as edn]
     [clojure.tools.logging :as log]
+    [clojure.walk :as walk]
     [datomic.client.api :as d]
     [datomic.client.api.protocols :as client-protocols]
-    [clojure.walk :as walk]
     [dev.kwill.datomic-backup.retry :as retry])
-  (:import (java.util Date)))
+  (:import (clojure.lang ExceptionInfo)
+           (java.util Date)))
 
 (defrecord Datom [e a v tx added]
   clojure.lang.Indexed
@@ -277,6 +279,56 @@
         (cond-> {:limit -1 :end exclusive-stop-t}
           start (assoc :start start)
           timeout (assoc :timeout timeout))))))
+
+(defn read-transactions-to-chan!
+  "Read transactions to a channel with retry and resumption.
+  Similar to read-datoms-to-chan! but for transactions.
+
+  Parameters:
+  - conn: Datomic connection
+  - argm: Map with keys:
+    - :start - Starting t value (inclusive, optional)
+    - :stop - Stopping t value (exclusive, optional)
+    - :xf - Transducer to apply to transaction datoms (optional)
+  - dest-ch: Channel to write transactions to"
+  [conn argm dest-ch]
+  (let [exclusive-stop-t (or (:stop argm) (inc (:t (d/db conn))))
+        start-t (or (:start argm) 0)
+        xf (or (:xf argm) (map identity))
+        *current-t (volatile! nil)
+        *counter (volatile! 0)]
+    (try
+      (doseq [tx-data (d/tx-range conn {:start start-t :end exclusive-stop-t :limit -1})]
+        (when (and (::_debug argm) (zero? (mod (vswap! *counter inc) 100)))
+          (log/info "Transaction reader progress"
+            :t (:t tx-data)
+            :txs-sent @*counter
+            :tx-ch-buffer-count (some-> dest-ch .buf .count)))
+
+        (let [datoms (into [] xf (:data tx-data))]
+          (when (seq datoms)
+            (async/>!! dest-ch datoms)))
+
+        (vreset! *current-t (:t tx-data)))
+
+      (async/close! dest-ch)
+
+      (catch ExceptionInfo ex
+        (cond
+          (retry/default-retriable? ex)
+          (do
+            (log/warn "Retryable anomaly while reading transactions. Retrying with :start set..."
+              :anomaly (ex-data ex)
+              :current-t @*current-t)
+            (read-transactions-to-chan! conn
+              (assoc argm
+                :start @*current-t
+                :stop exclusive-stop-t)
+              dest-ch))
+          :else
+          (do
+            (async/close! dest-ch)
+            (throw ex)))))))
 
 (defn conn? [x] (satisfies? client-protocols/Connection x))
 
