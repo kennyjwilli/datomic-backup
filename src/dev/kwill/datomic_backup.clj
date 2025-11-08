@@ -29,7 +29,11 @@
         start-t (some-> (:last-source-tx init-state) inc)
         tx-ch (async/chan 100)
         ignore-ids (if skip-ignore-bootstrap-datoms? #{} (into #{} (map :e) (impl/bootstrap-datoms source-db)))
-        transactions-xf (comp (remove #(contains? ignore-ids (:e %))) tx-range-datoms-xf)]
+        tx-instant-eid (:db/id (d/pull source-db [:db/id] :db/txInstant))
+        transactions-xf (comp
+                          (remove #(contains? ignore-ids (:e %)))
+                          (remove (fn [d] (and (= (:e d) (:tx d)) (= tx-instant-eid (:a d)))))
+                          tx-range-datoms-xf)]
     (log/info "Starting restore" :source "conn" :start-t start-t :max-tx max-tx)
     ;; Start reading transactions to channel in background
     (async/thread
@@ -336,9 +340,6 @@
                                       :dest-conn                     dest-conn
                                       :init-state                    init-state
                                       :lookup-dest-eid-fn            lookup-dest-eid-fn
-                                      ;; TODO: support transaction entities
-                                      ;; removed for now due to :db.error/past-tx-instant
-                                      :tx-range-datoms-xf            (remove (fn [d] (= (:e d) (:tx d))))
                                       :skip-ignore-bootstrap-datoms? true})
                   {:keys [tx-count source-eid->dest-eid last-source-tx]} result
                   ;; Filter to only new mappings

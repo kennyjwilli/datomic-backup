@@ -109,54 +109,61 @@
 (defn datom-batch-tx-data
   [source-db datoms source-eid->dest-eid lookup-dest-eid-fn]
   (let [effective-eid (fn [eid]
-                        (or
-                          (get source-eid->dest-eid eid)
+                        (or (source-eid->dest-eid eid)
                           (lookup-dest-eid-fn eid)
                           (tempid eid)))
+
         ref? (fn [a] (= :db.type/ref (attr-value-type source-db a)))
 
-        ;; Process value: handle tuples with refs, regular refs, or pass through
         process-value (fn [attr val]
                         (cond
-                          ;; Check if this is a tuple attribute
                           (vector? val)
-                          (if-let [element-types (tuple-element-types source-db attr)]
+                          (if-let [types (tuple-element-types source-db attr)]
                             ;; It's a tuple - remap refs element-by-element
                             (mapv (fn [type v]
                                     (if (= type :db.type/ref)
                                       (if (nil? v) nil (effective-eid v))
                                       v))
-                              element-types
-                              val)
+                              types val)
                             ;; Vector but not a tuple (shouldn't happen)
-                            (throw (ex-info "Value is a vector but cannot look up tuple types." {:value val :attr attr})))
+                            (throw (ex-info "Vector value but no tuple types found"
+                                     {:value val :attr attr})))
 
                           ;; Regular ref attribute
-                          (ref? attr)
-                          (effective-eid val)
+                          (ref? attr) (effective-eid val)
 
                           ;; Scalar value
-                          :else
-                          val))]
-    (->> datoms
-      ;; TODO: support transaction entity metadata
-      ;; Filter out transaction entity datoms (e.g., :db/txInstant)
-      ;; These will be automatically added by Datomic with fresh timestamps
-      (remove (fn [d] (= (:e d) (:tx d))))
-      (map (fn [d]
-             (let [[e a v tx added] d]
-               [(if added :db/add :db/retract)
-                (if (= e tx) "datomic.tx" (effective-eid (:e d)))
-                (effective-eid a)
-                (process-value a v)]))))))
+                          :else val))
 
-(comment
-  (let [[e a v tx] (first (d/datoms (d/db dest-conn) {:index :eavt}))]
-    [e])
-  (datom-batch-tx-data
-    (d/db dest-conn)
-    (second (first transactions))
-    (initial-eid-mapping (d/db dest-conn))))
+        ->tx-stmt (fn [{[e a v tx added] :datom}]
+                    [(if added :db/add :db/retract)
+                     (if (= e tx) "datomic.tx" (effective-eid e))
+                     (effective-eid a)
+                     (if (= v tx) "datomic.tx" (process-value a v))])
+
+        handle-datom (fn [{:keys [e+a->idx tx-data]} d]
+                       (let [[e a _ _ added] d
+                             key [e a]
+                             existing-idx (e+a->idx key)]
+                         (cond
+                           ;; Retract of existing add - skip it
+                           (and (not added) existing-idx)
+                           {:e+a->idx e+a->idx, :tx-data tx-data}
+
+                           ;; Replace existing (add always wins)
+                           existing-idx
+                           {:e+a->idx e+a->idx
+                            :tx-data  (assoc tx-data existing-idx (->tx-stmt {:datom d}))}
+
+                           ;; New entry
+                           :else
+                           {:e+a->idx (assoc e+a->idx key (count tx-data))
+                            :tx-data  (conj tx-data (->tx-stmt {:datom d}))})))]
+
+    ;; we must maintain the same order as `datoms` (else schema installs could be done out-of-order & will fail)
+    (->> datoms
+      (reduce handle-datom {:e+a->idx {}, :tx-data []})
+      :tx-data)))
 
 (defn next-data
   [tx-report]
