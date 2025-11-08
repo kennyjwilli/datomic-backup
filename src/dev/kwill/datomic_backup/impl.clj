@@ -107,20 +107,20 @@
 (defn tempid [x] (str tid-prefix x))
 
 (defn datom-batch-tx-data
-  [dest-db datoms source-eid->dest-eid lookup-dest-eid-fn]
+  [source-db datoms source-eid->dest-eid lookup-dest-eid-fn]
   (let [effective-eid (fn [eid]
                         (or
                           (get source-eid->dest-eid eid)
                           (lookup-dest-eid-fn eid)
                           (tempid eid)))
-        ref? (fn [a] (= :db.type/ref (attr-value-type dest-db a)))
+        ref? (fn [a] (= :db.type/ref (attr-value-type source-db a)))
 
         ;; Process value: handle tuples with refs, regular refs, or pass through
         process-value (fn [attr val]
                         (cond
                           ;; Check if this is a tuple attribute
                           (vector? val)
-                          (if-let [element-types (tuple-element-types dest-db attr)]
+                          (if-let [element-types (tuple-element-types source-db attr)]
                             ;; It's a tuple - remap refs element-by-element
                             (mapv (fn [type v]
                                     (if (= type :db.type/ref)
@@ -339,9 +339,9 @@
     (transactions-from-file source arg-map)))
 
 (defn next-datoms-state
-  [{:keys [source-eid->dest-eid db-before] :as acc} datoms lookup-dest-eid-fn tx!]
+  [{:keys [source-eid->dest-eid db-before] :as acc} source-db datoms lookup-dest-eid-fn tx!]
   (let [;; TODO: Could batch lookups
-        tx-data (datom-batch-tx-data db-before datoms source-eid->dest-eid lookup-dest-eid-fn)
+        tx-data (datom-batch-tx-data source-db datoms source-eid->dest-eid lookup-dest-eid-fn)
         tx-report (try
                     (retry/with-retry #(tx! {:tx-data tx-data}))
                     (catch Exception ex

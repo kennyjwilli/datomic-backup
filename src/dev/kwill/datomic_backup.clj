@@ -10,24 +10,25 @@
     [dev.kwill.datomic-backup.retry :as retry]))
 
 (defn restore-db
-  [{:keys [source dest-conn stop init-state with? transact progress lookup-dest-eid-fn]
+  [{:keys [source dest-conn stop init-state with? transact progress lookup-dest-eid-fn skip-ignore-bootstrap-datoms?]
     :or   {transact           d/transact
            lookup-dest-eid-fn (constantly nil)}
     :as   argm}]
   (let [tx-range-datoms-xf (or (:tx-range-datoms-xf argm) (map identity))
         max-tx (when progress (impl/max-tx-id-from-source source))
         init-db ((if with? d/with-db d/db) dest-conn)
+        source-db (d/db source)
         ;; While most often the Datomic internal DB eids are the same, we should not make that assumption.
         ;; Since we are replaying transactions that may include schema entities (e.g., :db/ident), we must
         ;; know how Datomic internal eids map between source and dest.
-        internal-source-eid->dest-eid (impl/q-datomic-internal-source-eid->dest-eid (d/db source) (d/db dest-conn))
+        internal-source-eid->dest-eid (impl/q-datomic-internal-source-eid->dest-eid source-db (d/db dest-conn))
         init-state (assoc init-state
                      :tx-count 0
                      :db-before init-db
                      :source-eid->dest-eid (merge (:source-eid->dest-eid init-state) internal-source-eid->dest-eid))
         start-t (some-> (:last-source-tx init-state) inc)
         tx-ch (async/chan 100)
-        ignore-ids (into #{} (map :e) (impl/bootstrap-datoms (d/db source)))
+        ignore-ids (if skip-ignore-bootstrap-datoms? #{} (into #{} (map :e) (impl/bootstrap-datoms source-db)))
         transactions-xf (comp (remove #(contains? ignore-ids (:e %))) tx-range-datoms-xf)]
     (log/info "Starting restore" :source "conn" :start-t start-t :max-tx max-tx)
     ;; Start reading transactions to channel in background
@@ -47,7 +48,7 @@
                      (do
                        (log/info "Processing datoms batch" :count (count datoms) :first-tx (:tx (first datoms)))
                        (let [tx! (if with? #(d/with (:db-before state) %) #(transact dest-conn %))
-                             new-state (impl/next-datoms-state state datoms lookup-dest-eid-fn tx!)
+                             new-state (impl/next-datoms-state state source-db datoms lookup-dest-eid-fn tx!)
                              tx-count (:tx-count new-state)]
                          (when (zero? (mod tx-count 100))
                            (log/info "Processed transactions"
@@ -317,8 +318,10 @@
 
             ;; Load existing mappings
             (let [state-db (d/db state-conn)
+                  ;; TODO: existing mappings
                   ;existing-mappings (rs/load-eid-mappings state-db session-id)
                   ;_ (log/info "Loaded existing EID mappings" {:count (count existing-mappings)})
+                  source-eid->dest-eid (or (:source-eid->dest-eid opts) {})
 
                   *source->dest-cache (atom {})
                   lookup-dest-eid-fn (fn [source-eid]
@@ -328,22 +331,20 @@
                                            dest-eid)))
                   ;; Perform incremental restore using restore-db
                   init-state {:last-source-tx       last-source-tx
-                              :source-eid->dest-eid {}}
-                  result (restore-db {:source             source-conn
-                                      :dest-conn          dest-conn
-                                      :init-state         init-state
-                                      :lookup-dest-eid-fn lookup-dest-eid-fn
-                                      :transform-datoms   (fn [datoms]
-                                                            ;; TODO: support transaction entities
-                                                            ;; removed for now due to :db.error/past-tx-instant
-                                                            (remove (fn [d] (= (:e d) (:tx d))) datoms))})
+                              :source-eid->dest-eid source-eid->dest-eid}
+                  result (restore-db {:source                        source-conn
+                                      :dest-conn                     dest-conn
+                                      :init-state                    init-state
+                                      :lookup-dest-eid-fn            lookup-dest-eid-fn
                                       ;; TODO: support transaction entities
                                       ;; removed for now due to :db.error/past-tx-instant
-                                      :tx-range-datoms-xf (remove (fn [d] (= (:e d) (:tx d))))})
+                                      :tx-range-datoms-xf            (remove (fn [d] (= (:e d) (:tx d))))
+                                      :skip-ignore-bootstrap-datoms? true})
                   {:keys [tx-count source-eid->dest-eid last-source-tx]} result
-
                   ;; Filter to only new mappings
-                  new-mappings (apply dissoc source-eid->dest-eid (keys @*source->dest-cache))]
+                  new-mappings (apply dissoc source-eid->dest-eid (keys @*source->dest-cache))
+                  ;new-mappings (apply dissoc source-eid->dest-eid (keys existing-mappings))
+                  ]
 
               (log/info "Incremental restore complete"
                 {:session-id            session-id
