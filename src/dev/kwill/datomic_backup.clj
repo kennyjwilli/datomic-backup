@@ -47,22 +47,32 @@
           (log/error ex "Fatal error reading transactions")
           (async/close! tx-ch))))
     ;; Process transactions from channel
-    (let [result (loop [state init-state]
+    (let [loop-start (System/currentTimeMillis)
+          result (loop [state init-state
+                        last-checkpoint-time loop-start]
                    (if-let [datoms (async/<!! tx-ch)]
                      (do
                        (log/info "Processing datoms batch" :count (count datoms) :first-tx (:tx (first datoms)))
                        (let [tx! (if with? #(d/with (:db-before state) %) #(transact dest-conn %))
                              new-state (impl/next-datoms-state state source-db datoms lookup-dest-eid-fn tx!)
-                             tx-count (:tx-count new-state)]
+                             tx-count (:tx-count new-state)
+                             now (System/currentTimeMillis)]
                          (when (zero? (mod tx-count 100))
-                           (log/info "Processed transactions"
-                             :tx-count tx-count
-                             :last-source-tx (:last-source-tx new-state)
-                             :max-tx max-tx
-                             :percent (when max-tx (format "%.1f%%" (* 100.0 (/ (:last-source-tx new-state) max-tx))))))
-                         (recur new-state)))
-                     state))
-          _ (log/info "Restore complete" :tx-count (:tx-count result))
+                           (let [elapsed-since-start (- now loop-start)
+                                 elapsed-since-checkpoint (- now last-checkpoint-time)
+                                 rate (if (pos? elapsed-since-checkpoint)
+                                        (/ 100.0 (/ elapsed-since-checkpoint 1000.0))
+                                        0.0)]
+                             (log/info "Processed transactions"
+                               :tx-count tx-count
+                               :last-source-tx (:last-source-tx new-state)
+                               :max-tx max-tx
+                               :percent (when max-tx (format "%.1f%%" (* 100.0 (/ (:last-source-tx new-state) max-tx))))
+                               :elapsed (impl/format-duration elapsed-since-start)
+                               :rate (format "%.1f tx/sec" rate))))
+                         (recur new-state (if (zero? (mod tx-count 100)) now last-checkpoint-time))))
+                     (assoc state :total-time-ms (- (System/currentTimeMillis) loop-start))))
+          _ (log/info "Restore complete" :tx-count (:tx-count result) :total-time (impl/format-duration (:total-time-ms result 0)))
           source-eid->dest-eid (apply dissoc (:source-eid->dest-eid result) (keys internal-source-eid->dest-eid))]
       (assoc result :source-eid->dest-eid source-eid->dest-eid))))
 
@@ -328,10 +338,19 @@
                   source-eid->dest-eid (or (:source-eid->dest-eid opts) {})
 
                   *source->dest-cache (atom {})
+                  *lookup-stats (atom {:count 0 :total-ms 0 :cache-hits 0})
                   lookup-dest-eid-fn (fn [source-eid]
-                                       (or (get @*source->dest-cache source-eid)
-                                         (when-let [dest-eid (rs/q-dest-eid-from-source-eid state-db source-eid)]
-                                           (swap! *source->dest-cache assoc source-eid dest-eid)
+                                       (if-let [cached (get @*source->dest-cache source-eid)]
+                                         (do
+                                           (swap! *lookup-stats update :cache-hits inc)
+                                           cached)
+                                         (let [start (System/currentTimeMillis)
+                                               dest-eid (rs/q-dest-eid-from-source-eid state-db source-eid)
+                                               elapsed (- (System/currentTimeMillis) start)]
+                                           (swap! *lookup-stats update :count inc)
+                                           (swap! *lookup-stats update :total-ms + elapsed)
+                                           (when dest-eid
+                                             (swap! *source->dest-cache assoc source-eid dest-eid))
                                            dest-eid)))
                   ;; Perform incremental restore using restore-db
                   init-state {:last-source-tx       last-source-tx
@@ -341,17 +360,45 @@
                                       :init-state                    init-state
                                       :lookup-dest-eid-fn            lookup-dest-eid-fn
                                       :skip-ignore-bootstrap-datoms? true})
-                  {:keys [tx-count source-eid->dest-eid last-source-tx]} result
+                  {:keys [tx-count source-eid->dest-eid last-source-tx db-time-ms total-time-ms]} result
                   ;; Filter to only new mappings
                   new-mappings (apply dissoc source-eid->dest-eid (keys @*source->dest-cache))
                   ;new-mappings (apply dissoc source-eid->dest-eid (keys existing-mappings))
-                  ]
+
+                  ;; Calculate performance metrics
+                  {:keys [count total-ms cache-hits]} @*lookup-stats
+                  total-lookups (+ count cache-hits)
+                  lookup-time-ms (or total-ms 0)
+                  db-time (or db-time-ms 0)
+                  total-time (or total-time-ms 1)
+                  other-time-ms (- total-time db-time lookup-time-ms)]
 
               (log/info "Incremental restore complete"
                 {:session-id            session-id
                  :transactions-replayed tx-count
                  :new-mappings          (count new-mappings)
                  :last-source-tx        last-source-tx})
+
+              ;; Performance summary
+              (log/info "=== Restore Performance Summary ===")
+              (log/info (format "Total time: %s" (impl/format-duration total-time)))
+              (log/info (format "Transactions: %d (%.1f tx/sec)"
+                          tx-count
+                          (if (pos? total-time) (/ tx-count (/ total-time 1000.0)) 0.0)))
+              (log/info "Time breakdown:")
+              (log/info (format "  Database operations: %s (%.1f%%)"
+                          (impl/format-duration db-time)
+                          (if (pos? total-time) (* 100.0 (/ db-time total-time)) 0.0)))
+              (log/info (format "  Entity ID lookups: %s (%.1f%%) - %d queries, %d cache hits"
+                          (impl/format-duration lookup-time-ms)
+                          (if (pos? total-time) (* 100.0 (/ lookup-time-ms total-time)) 0.0)
+                          count
+                          cache-hits))
+              (when (pos? count)
+                (log/info (format "    Avg lookup time: %.2fms/query" (/ lookup-time-ms (double count)))))
+              (log/info (format "  Other (processing): %s (%.1f%%)"
+                          (impl/format-duration other-time-ms)
+                          (if (pos? total-time) (* 100.0 (/ other-time-ms total-time)) 0.0)))
 
               ;; Store new mappings and update session
               (rs/update-restore-state! state-conn

@@ -106,6 +106,22 @@
 (def tid-prefix "__tid")
 (defn tempid [x] (str tid-prefix x))
 
+(defn format-duration
+  "Format milliseconds as human-readable duration"
+  [ms]
+  (cond
+    (< ms 1000) (format "%.0fms" (double ms))
+    (< ms 60000) (format "%.2fs" (/ ms 1000.0))
+    :else (format "%.2fm" (/ ms 60000.0))))
+
+(defmacro with-timing
+  "Execute body and return [result elapsed-ms]"
+  [& body]
+  `(let [start# (System/currentTimeMillis)
+         result# (do ~@body)
+         elapsed# (- (System/currentTimeMillis) start#)]
+     [result# elapsed#]))
+
 (defn datom-batch-tx-data
   [source-db datoms source-eid->dest-eid lookup-dest-eid-fn]
   (let [effective-eid (memoize
@@ -352,18 +368,20 @@
   [{:keys [source-eid->dest-eid db-before] :as acc} source-db datoms lookup-dest-eid-fn tx!]
   (let [;; TODO: Could batch lookups
         tx-data (datom-batch-tx-data source-db datoms source-eid->dest-eid lookup-dest-eid-fn)
-        tx-report (try
-                    (retry/with-retry #(tx! {:tx-data tx-data}))
-                    (catch Exception ex
-                      ;; (sc.api/spy)
-                      (throw ex)))
+        [tx-report db-elapsed] (with-timing
+                                 (try
+                                   (retry/with-retry #(tx! {:tx-data tx-data}))
+                                   (catch Exception ex
+                                     (sc.api/spy)
+                                     (throw ex))))
         nd (next-data tx-report)]
     (-> acc
       (assoc
         :db-before (:db-after tx-report)
         :last-source-tx (:tx (first datoms)))
       (update :source-eid->dest-eid merge (:source-eid->dest-eid nd))
-      (update :tx-count inc))))
+      (update :tx-count inc)
+      (update :db-time-ms (fnil + 0) db-elapsed))))
 
 (def separator (System/getProperty "line.separator"))
 
