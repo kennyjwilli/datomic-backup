@@ -1030,11 +1030,13 @@
 
         composite-tuple-schema (filter :db/tupleAttrs (::impl/schema-raw schema-lookup))
         composite-tuple-attrs (map :db/ident composite-tuple-schema)
-        _ (when (seq composite-tuple-attrs)
-            (log/info "Processing composite tuple attributes"
-              :tuple-attr-count (count composite-tuple-attrs))
-            (copy-schema! {:dest-conn     dest-conn
-                           :attrs         composite-tuple-attrs
-                           :schema-lookup schema-lookup})
-            (add-tuple-attrs! {:dest-conn dest-conn :tuple-schema composite-tuple-schema}))]
-    result))
+        {composite-old-id->new-id :old-id->new-id}
+        (when (seq composite-tuple-attrs)
+          (log/info "Processing composite tuple attributes"
+            :tuple-attr-count (count composite-tuple-attrs))
+          (let [copy-result (copy-schema! {:dest-conn     dest-conn
+                                           :attrs         composite-tuple-attrs
+                                           :schema-lookup schema-lookup})]
+            (add-tuple-attrs! {:dest-conn dest-conn :tuple-schema composite-tuple-schema})
+            copy-result))]
+    (update result :old-id->new-id merge composite-old-id->new-id)))

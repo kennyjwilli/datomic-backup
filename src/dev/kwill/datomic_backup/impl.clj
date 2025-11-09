@@ -372,7 +372,7 @@
                                  (try
                                    (retry/with-retry #(tx! {:tx-data tx-data}))
                                    (catch Exception ex
-                                     (sc.api/spy)
+                                     ;(sc.api/spy)
                                      (throw ex))))
         nd (next-data tx-report)]
     (-> acc
