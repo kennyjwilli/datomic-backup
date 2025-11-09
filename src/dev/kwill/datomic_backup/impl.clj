@@ -108,17 +108,20 @@
 
 (defn datom-batch-tx-data
   [source-db datoms source-eid->dest-eid lookup-dest-eid-fn]
-  (let [effective-eid (fn [eid]
-                        (or (source-eid->dest-eid eid)
-                          (lookup-dest-eid-fn eid)
-                          (tempid eid)))
+  (let [effective-eid (memoize
+                        (fn [eid]
+                          (or (source-eid->dest-eid eid)
+                            (lookup-dest-eid-fn eid)
+                            (tempid eid))))
 
-        ref? (fn [a] (= :db.type/ref (attr-value-type source-db a)))
+        get-attr-value-type (memoize #(attr-value-type source-db %))
+        get-tuple-types (memoize #(tuple-element-types source-db %))
+        ref? (fn [a] (= :db.type/ref (get-attr-value-type a)))
 
         process-value (fn [attr val]
                         (cond
                           (vector? val)
-                          (if-let [types (tuple-element-types source-db attr)]
+                          (if-let [types (get-tuple-types attr)]
                             ;; It's a tuple - remap refs element-by-element
                             (mapv (fn [type v]
                                     (if (= type :db.type/ref)
