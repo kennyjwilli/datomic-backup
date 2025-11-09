@@ -2,8 +2,8 @@
   (:require
     [clojure.test :refer :all]
     [datomic.client.api :as d]
-    [dev.kwill.datomic-backup.test-helpers :as testh]
-    [dev.kwill.datomic-backup.impl :as impl]))
+    [dev.kwill.datomic-backup.impl :as impl]
+    [dev.kwill.datomic-backup.test-helpers :as testh]))
 
 (defn attr-id
   [db attr]
@@ -93,7 +93,7 @@
                        two-refs-attr-eid two-refs-attr-eid} ; attr unchanged
 
               ;; Process with datom-batch-tx-data
-              tx-data (impl/datom-batch-tx-data dest-db [tuple-datom] eid-map)
+              tx-data (impl/datom-batch-tx-data dest-db [tuple-datom] eid-map (constantly nil))
               processed-tuple-value (nth (first tx-data) 3)]
 
           (is (= [200 300] processed-tuple-value)

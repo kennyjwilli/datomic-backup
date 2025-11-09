@@ -60,12 +60,19 @@
                                :db/unique      :db.unique/identity}]
             _ (d/transact (:source-conn ctx) {:tx-data schema-with-deps})
             source-db (d/db (:source-conn ctx))
-            schema-lookup (impl/q-schema-lookup source-db)]
+            schema-lookup (impl/q-schema-lookup source-db)
 
-        ;; Copy schema to dest - should handle dependencies correctly
-        (csr/copy-schema! {:dest-conn     (:dest-conn ctx)
-                           :schema-lookup schema-lookup
-                           :attrs         (map :db/ident (::impl/schema-raw schema-lookup))})
+            ;; Copy schema to dest - should handle dependencies correctly
+            {:keys [old-id->new-id]} (csr/copy-schema! {:dest-conn     (:dest-conn ctx)
+                                                        :schema-lookup schema-lookup
+                                                        :attrs         (map :db/ident (::impl/schema-raw schema-lookup))})]
+
+        ;; Verify composite tuple attribute ID is in the mapping
+        (let [composite-tuple-attr-id (ffirst (d/q '[:find ?e
+                                                     :where [?e :db/ident :semester/year+season]]
+                                                source-db))]
+          (is (contains? old-id->new-id composite-tuple-attr-id)
+            "Composite tuple attribute ID should be in old-id->new-id mapping"))
 
         ;; Verify schema matches
         (let [dest-db (d/db (:dest-conn ctx))

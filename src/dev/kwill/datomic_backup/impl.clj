@@ -1,14 +1,16 @@
 (ns dev.kwill.datomic-backup.impl
   (:require
+    [clojure.core.async :as async]
+    [clojure.edn :as edn]
     [clojure.java.io :as io]
     [clojure.string :as str]
-    [clojure.edn :as edn]
     [clojure.tools.logging :as log]
+    [clojure.walk :as walk]
     [datomic.client.api :as d]
     [datomic.client.api.protocols :as client-protocols]
-    [clojure.walk :as walk]
     [dev.kwill.datomic-backup.retry :as retry])
-  (:import (java.util Date)))
+  (:import (clojure.lang ExceptionInfo)
+           (java.util Date)))
 
 (defrecord Datom [e a v tx added]
   clojure.lang.Indexed
@@ -104,53 +106,83 @@
 (def tid-prefix "__tid")
 (defn tempid [x] (str tid-prefix x))
 
-(defn datom-batch-tx-data
-  [dest-db datoms source-eid->dest-eid]
-  (let [effective-eid (fn [eid] (get source-eid->dest-eid eid (tempid eid)))
-        ref? (fn [a] (= :db.type/ref (attr-value-type dest-db a)))
+(defn format-duration
+  "Format milliseconds as human-readable duration"
+  [ms]
+  (cond
+    (< ms 1000) (format "%.0fms" (double ms))
+    (< ms 60000) (format "%.2fs" (/ ms 1000.0))
+    :else (format "%.2fm" (/ ms 60000.0))))
 
-        ;; Process value: handle tuples with refs, regular refs, or pass through
+(defmacro with-timing
+  "Execute body and return [result elapsed-ms]"
+  [& body]
+  `(let [start# (System/currentTimeMillis)
+         result# (do ~@body)
+         elapsed# (- (System/currentTimeMillis) start#)]
+     [result# elapsed#]))
+
+(defn datom-batch-tx-data
+  [source-db datoms source-eid->dest-eid lookup-dest-eid-fn]
+  (let [effective-eid (memoize
+                        (fn [eid]
+                          (or (source-eid->dest-eid eid)
+                            (lookup-dest-eid-fn eid)
+                            (tempid eid))))
+
+        get-attr-value-type (memoize #(attr-value-type source-db %))
+        get-tuple-types (memoize #(tuple-element-types source-db %))
+        ref? (fn [a] (= :db.type/ref (get-attr-value-type a)))
+
         process-value (fn [attr val]
                         (cond
-                          ;; Check if this is a tuple attribute
                           (vector? val)
-                          (if-let [element-types (tuple-element-types dest-db attr)]
+                          (if-let [types (get-tuple-types attr)]
                             ;; It's a tuple - remap refs element-by-element
                             (mapv (fn [type v]
                                     (if (= type :db.type/ref)
                                       (if (nil? v) nil (effective-eid v))
                                       v))
-                              element-types
-                              val)
+                              types val)
                             ;; Vector but not a tuple (shouldn't happen)
-                            (throw (ex-info "Value is a vector but cannot look up tuple types." {:value val :attr attr})))
+                            (throw (ex-info "Vector value but no tuple types found"
+                                     {:value val :attr attr})))
 
                           ;; Regular ref attribute
-                          (ref? attr)
-                          (effective-eid val)
+                          (ref? attr) (effective-eid val)
 
                           ;; Scalar value
-                          :else
-                          val))]
-    (->> datoms
-      ;; TODO: support transaction entity metadata
-      ;; Filter out transaction entity datoms (e.g., :db/txInstant)
-      ;; These will be automatically added by Datomic with fresh timestamps
-      (remove (fn [d] (= (:e d) (:tx d))))
-      (map (fn [d]
-             (let [[e a v tx added] d]
-               [(if added :db/add :db/retract)
-                (if (= e tx) "datomic.tx" (effective-eid (:e d)))
-                (effective-eid a)
-                (process-value a v)]))))))
+                          :else val))
 
-(comment
-  (let [[e a v tx] (first (d/datoms (d/db dest-conn) {:index :eavt}))]
-    [e])
-  (datom-batch-tx-data
-    (d/db dest-conn)
-    (second (first transactions))
-    (initial-eid-mapping (d/db dest-conn))))
+        ->tx-stmt (fn [{[e a v tx added] :datom}]
+                    [(if added :db/add :db/retract)
+                     (if (= e tx) "datomic.tx" (effective-eid e))
+                     (effective-eid a)
+                     (if (= v tx) "datomic.tx" (process-value a v))])
+
+        handle-datom (fn [{:keys [e+a->idx tx-data]} d]
+                       (let [[e a _ _ added] d
+                             key [e a]
+                             existing-idx (e+a->idx key)]
+                         (cond
+                           ;; Retract of existing add - skip it
+                           (and (not added) existing-idx)
+                           {:e+a->idx e+a->idx, :tx-data tx-data}
+
+                           ;; Replace existing (add always wins)
+                           existing-idx
+                           {:e+a->idx e+a->idx
+                            :tx-data  (assoc tx-data existing-idx (->tx-stmt {:datom d}))}
+
+                           ;; New entry
+                           :else
+                           {:e+a->idx (assoc e+a->idx key (count tx-data))
+                            :tx-data  (conj tx-data (->tx-stmt {:datom d}))})))]
+
+    ;; we must maintain the same order as `datoms` (else schema installs could be done out-of-order & will fail)
+    (->> datoms
+      (reduce handle-datom {:e+a->idx {}, :tx-data []})
+      :tx-data)))
 
 (defn next-data
   [tx-report]
@@ -274,6 +306,56 @@
           start (assoc :start start)
           timeout (assoc :timeout timeout))))))
 
+(defn read-transactions-to-chan!
+  "Read transactions to a channel with retry and resumption.
+  Similar to read-datoms-to-chan! but for transactions.
+
+  Parameters:
+  - conn: Datomic connection
+  - argm: Map with keys:
+    - :start - Starting t or tx value (inclusive, optional)
+    - :stop - Stopping t or tx value (exclusive, optional)
+    - :xf - Transducer to apply to transaction datoms (optional)
+  - dest-ch: Channel to write transactions to"
+  [conn argm dest-ch]
+  (let [exclusive-stop (or (:stop argm) (inc (:t (d/db conn))))
+        start (or (:start argm) 0)
+        xf (or (:xf argm) (map identity))
+        *current-t (volatile! nil)
+        *counter (volatile! 0)]
+    (try
+      (doseq [tx-data (d/tx-range conn {:start start :end exclusive-stop :limit -1})]
+        (when (and (::_debug argm) (zero? (mod (vswap! *counter inc) 100)))
+          (log/info "Transaction reader progress"
+            :t (:t tx-data)
+            :txs-sent @*counter
+            :tx-ch-buffer-count (some-> dest-ch .buf .count)))
+
+        (let [datoms (into [] xf (:data tx-data))]
+          (when (seq datoms)
+            (async/>!! dest-ch datoms)))
+
+        (vreset! *current-t (:t tx-data)))
+
+      (async/close! dest-ch)
+
+      (catch ExceptionInfo ex
+        (cond
+          (retry/default-retriable? ex)
+          (do
+            (log/warn "Retryable anomaly while reading transactions. Retrying with :start set..."
+              :anomaly (ex-data ex)
+              :current-t @*current-t)
+            (read-transactions-to-chan! conn
+              (assoc argm
+                :start @*current-t
+                :stop exclusive-stop)
+              dest-ch))
+          :else
+          (do
+            (async/close! dest-ch)
+            (throw ex)))))))
+
 (defn conn? [x] (satisfies? client-protocols/Connection x))
 
 (defn transactions-from-source
@@ -283,20 +365,23 @@
     (transactions-from-file source arg-map)))
 
 (defn next-datoms-state
-  [{:keys [source-eid->dest-eid db-before] :as acc} datoms tx!]
-  (let [tx-data (datom-batch-tx-data db-before datoms source-eid->dest-eid)
-        tx-report (try
-                    (retry/with-retry #(tx! {:tx-data tx-data}))
-                    (catch Exception ex
-                      ;; (sc.api/spy)
-                      (throw ex)))
+  [{:keys [source-eid->dest-eid db-before] :as acc} source-db datoms lookup-dest-eid-fn tx!]
+  (let [;; TODO: Could batch lookups
+        tx-data (datom-batch-tx-data source-db datoms source-eid->dest-eid lookup-dest-eid-fn)
+        [tx-report db-elapsed] (with-timing
+                                 (try
+                                   (retry/with-retry #(tx! {:tx-data tx-data}))
+                                   (catch Exception ex
+                                     ;(sc.api/spy)
+                                     (throw ex))))
         nd (next-data tx-report)]
     (-> acc
       (assoc
         :db-before (:db-after tx-report)
         :last-source-tx (:tx (first datoms)))
       (update :source-eid->dest-eid merge (:source-eid->dest-eid nd))
-      (update :tx-count inc))))
+      (update :tx-count inc)
+      (update :db-time-ms (fnil + 0) db-elapsed))))
 
 (def separator (System/getProperty "line.separator"))
 

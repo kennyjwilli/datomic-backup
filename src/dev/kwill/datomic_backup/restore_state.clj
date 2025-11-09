@@ -122,6 +122,26 @@
               (:kwill.datomic-backup.eid-mapping/dest-eid m)]))
       session-mappings)))
 
+(defn q-dest-eid-from-source-eid
+  [db source-eid]
+  (ffirst
+    (d/q '[:find ?dest
+           :in $ ?source
+           :where
+           [?e :kwill.datomic-backup.eid-mapping/source-eid ?source]
+           [?e :kwill.datomic-backup.eid-mapping/dest-eid ?dest]]
+      db source-eid)))
+
+(defn load-partial-eid-mappings
+  [db source-eids]
+  (into {}
+    (d/q '[:find ?source ?dest
+           :in $ [?source ...]
+           :where
+           [?e :kwill.datomic-backup.eid-mapping/source-eid ?source]
+           [?e :kwill.datomic-backup.eid-mapping/dest-eid ?dest]]
+      db source-eids)))
+
 (defn- eid-mapping-tx-data
   "Generate transaction data for a batch of EID mappings."
   [session-id mappings]
