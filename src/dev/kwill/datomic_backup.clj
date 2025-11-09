@@ -15,7 +15,8 @@
            lookup-dest-eid-fn (constantly nil)}
     :as   argm}]
   (let [tx-range-datoms-xf (or (:tx-range-datoms-xf argm) (map identity))
-        max-tx (when progress (impl/max-tx-id-from-source source))
+        max-tx (or (:max-tx argm)
+                   (when progress (impl/max-tx-id-from-source source)))
         init-db ((if with? d/with-db d/db) dest-conn)
         source-db (d/db source)
         ;; While most often the Datomic internal DB eids are the same, we should not make that assumption.
@@ -359,7 +360,10 @@
                                       :dest-conn                     dest-conn
                                       :init-state                    init-state
                                       :lookup-dest-eid-fn            lookup-dest-eid-fn
-                                      :skip-ignore-bootstrap-datoms? true})
+                                      :skip-ignore-bootstrap-datoms? true
+                                      :stop                          (inc current-tx)
+                                      :max-tx                        current-tx
+                                      :progress                      true})
                   {:keys [tx-count source-eid->dest-eid last-source-tx db-time-ms total-time-ms]} result
                   ;; Filter to only new mappings
                   new-mappings (apply dissoc source-eid->dest-eid (keys @*source->dest-cache))

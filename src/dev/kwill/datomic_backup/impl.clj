@@ -313,18 +313,18 @@
   Parameters:
   - conn: Datomic connection
   - argm: Map with keys:
-    - :start - Starting t value (inclusive, optional)
-    - :stop - Stopping t value (exclusive, optional)
+    - :start - Starting t or tx value (inclusive, optional)
+    - :stop - Stopping t or tx value (exclusive, optional)
     - :xf - Transducer to apply to transaction datoms (optional)
   - dest-ch: Channel to write transactions to"
   [conn argm dest-ch]
-  (let [exclusive-stop-t (or (:stop argm) (inc (:t (d/db conn))))
-        start-t (or (:start argm) 0)
+  (let [exclusive-stop (or (:stop argm) (inc (:t (d/db conn))))
+        start (or (:start argm) 0)
         xf (or (:xf argm) (map identity))
         *current-t (volatile! nil)
         *counter (volatile! 0)]
     (try
-      (doseq [tx-data (d/tx-range conn {:start start-t :end exclusive-stop-t :limit -1})]
+      (doseq [tx-data (d/tx-range conn {:start start :end exclusive-stop :limit -1})]
         (when (and (::_debug argm) (zero? (mod (vswap! *counter inc) 100)))
           (log/info "Transaction reader progress"
             :t (:t tx-data)
@@ -349,7 +349,7 @@
             (read-transactions-to-chan! conn
               (assoc argm
                 :start @*current-t
-                :stop exclusive-stop-t)
+                :stop exclusive-stop)
               dest-ch))
           :else
           (do
