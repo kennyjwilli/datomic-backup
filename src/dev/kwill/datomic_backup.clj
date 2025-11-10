@@ -68,7 +68,11 @@
                                :tx-count tx-count
                                :last-source-tx (:last-source-tx new-state)
                                :max-tx max-tx
-                               :percent (when max-tx (format "%.1f%%" (* 100.0 (/ (:last-source-tx new-state) max-tx))))
+                               :percent (when (and max-tx start-tx)
+                                          (let [progress (- (:last-source-tx new-state) start-tx)
+                                                total (- max-tx start-tx)]
+                                            (when (pos? total)
+                                              (format "%.1f%%" (* 100.0 (/ progress total))))))
                                :elapsed (impl/format-duration elapsed-since-start)
                                :rate (format "%.1f tx/sec" rate))))
                          (recur new-state (if (zero? (mod tx-count 100)) now last-checkpoint-time))))
