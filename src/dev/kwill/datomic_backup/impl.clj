@@ -78,7 +78,7 @@
 
 (defn attr-value-type
   [db attr]
-  (get-in (d/pull db [:db/valueType] attr) [:db/valueType :db/ident]))
+  (get-in (retry/with-retry #(d/pull db [:db/valueType] attr)) [:db/valueType :db/ident]))
 
 (defn tuple-element-types
   "Returns vector of value types for tuple elements, or nil if not a tuple.
@@ -87,7 +87,7 @@
   - Heterogeneous (:db/tupleTypes) - returns explicit types
   - Homogeneous (:db/tupleType) - repeats single type"
   [db attr]
-  (let [attr-schema (d/pull db [:db/valueType :db/tupleAttrs :db/tupleTypes :db/tupleType] attr)
+  (let [attr-schema (retry/with-retry #(d/pull db [:db/valueType :db/tupleAttrs :db/tupleTypes :db/tupleType] attr))
         value-type (get-in attr-schema [:db/valueType :db/ident])]
     (when (= value-type :db.type/tuple)
       (cond
